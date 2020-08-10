@@ -1,9 +1,9 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created : 13 Sep 2017 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -22,43 +22,44 @@
 %%%-------------------------------------------------------------------
 -module(mod_avatar).
 -behaviour(gen_mod).
+-protocol({xep, 398, '0.2.0'}).
 
 %% gen_mod API
--export([start/2, stop/1, reload/3, depends/2, mod_opt_type/1]).
+-export([start/2, stop/1, reload/3, depends/2, mod_opt_type/1, mod_options/1]).
+-export([mod_doc/0]).
 %% Hooks
--export([pubsub_publish_item/6, vcard_iq_convert/1, vcard_iq_publish/1]).
+-export([pubsub_publish_item/6, vcard_iq_convert/1, vcard_iq_publish/1,
+	 get_sm_features/5]).
 
 -include("xmpp.hrl").
 -include("logger.hrl").
 -include("pubsub.hrl").
+-include("translate.hrl").
 
--type convert_rules() :: {default | eimp:img_type(), eimp:img_type()}.
+-type avatar_id_meta() :: #{avatar_meta => {binary(), avatar_meta()}}.
+-opaque convert_rule() :: {default | eimp:img_type(), eimp:img_type()}.
+-export_type([convert_rule/0]).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 start(Host, _Opts) ->
-    case misc:have_eimp() of
-	true ->
-	    ejabberd_hooks:add(pubsub_publish_item, Host, ?MODULE,
-			       pubsub_publish_item, 50),
-	    ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE,
-			       vcard_iq_convert, 30),
-	    ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE,
-			       vcard_iq_publish, 100);
-	false ->
-	    ?CRITICAL_MSG("ejabberd is built without "
-			  "graphics support: reconfigure it with "
-			  "--enable-graphics or disable '~s'",
-			  [?MODULE]),
-	    {error, graphics_not_compiled}
-    end.
+    ejabberd_hooks:add(pubsub_publish_item, Host, ?MODULE,
+		       pubsub_publish_item, 50),
+    ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE,
+		       vcard_iq_convert, 30),
+    ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE,
+		       vcard_iq_publish, 100),
+    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
+		       get_sm_features, 50).
 
 stop(Host) ->
     ejabberd_hooks:delete(pubsub_publish_item, Host, ?MODULE,
 			  pubsub_publish_item, 50),
     ejabberd_hooks:delete(vcard_iq_set, Host, ?MODULE, vcard_iq_convert, 30),
-    ejabberd_hooks:delete(vcard_iq_set, Host, ?MODULE, vcard_iq_publish, 100).
+    ejabberd_hooks:delete(vcard_iq_set, Host, ?MODULE, vcard_iq_publish, 100),
+    ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE,
+			  get_sm_features, 50).
 
 reload(_Host, _NewOpts, _OldOpts) ->
     ok.
@@ -69,6 +70,7 @@ depends(_Host, _Opts) ->
 %%%===================================================================
 %%% Hooks
 %%%===================================================================
+-spec pubsub_publish_item(binary(), binary(), jid(), jid(), binary(), [xmlel()]) -> ok.
 pubsub_publish_item(LServer, ?NS_AVATAR_METADATA,
 		    #jid{luser = LUser, lserver = LServer} = From,
 		    #jid{luser = LUser, lserver = LServer} = Host,
@@ -77,7 +79,7 @@ pubsub_publish_item(LServer, ?NS_AVATAR_METADATA,
 	#avatar_meta{info = []} ->
 	    delete_vcard_avatar(From);
 	#avatar_meta{info = Info} ->
-	    Rules = get_converting_rules(LServer),
+	    Rules = mod_avatar_opt:convert(LServer),
 	    case get_meta_info(Info, Rules) of
 		#avatar_info{type = MimeType, id = ID, url = <<"">>} = I ->
 		    case get_avatar_data(Host, ID) of
@@ -96,11 +98,11 @@ pubsub_publish_item(LServer, ?NS_AVATAR_METADATA,
 		    set_vcard_avatar(From, Photo, #{})
 	    end;
 	_ ->
-	    ?WARNING_MSG("invalid avatar metadata of ~s@~s published "
-			 "with item id ~s",
+	    ?WARNING_MSG("Invalid avatar metadata of ~ts@~ts published "
+			 "with item id ~ts",
 			 [LUser, LServer, ItemId])
     catch _:{xmpp_codec, Why} ->
-	    ?WARNING_MSG("failed to decode avatar metadata of ~s@~s: ~s",
+	    ?WARNING_MSG("Failed to decode avatar metadata of ~ts@~ts: ~ts",
 			 [LUser, LServer, xmpp:format_error(Why)])
     end;
 pubsub_publish_item(_, _, _, _, _, _) ->
@@ -153,10 +155,24 @@ vcard_iq_publish(#iq{sub_els = [#vcard_temp{
 vcard_iq_publish(Acc) ->
     Acc.
 
+-spec get_sm_features({error, stanza_error()} | empty | {result, [binary()]},
+		      jid(), jid(), binary(), binary()) ->
+			     {error, stanza_error()} | empty | {result, [binary()]}.
+get_sm_features({error, _Error} = Acc, _From, _To, _Node, _Lang) ->
+    Acc;
+get_sm_features(Acc, _From, _To, <<"">>, _Lang) ->
+    {result, [?NS_PEP_VCARD_CONVERSION_0 |
+	      case Acc of
+		  {result, Features} -> Features;
+		  empty -> []
+	      end]};
+get_sm_features(Acc, _From, _To, _Node, _Lang) ->
+    Acc.
+
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec get_meta_info([avatar_info()], convert_rules()) -> avatar_info().
+-spec get_meta_info([avatar_info()], [convert_rule()]) -> avatar_info().
 get_meta_info(Info, Rules) ->
     case lists:foldl(
 	   fun(_, #avatar_info{} = Acc) ->
@@ -195,22 +211,27 @@ get_avatar_data(JID, ItemID) ->
 		#avatar_data{data = Data} ->
 		    {ok, Data};
 		_ ->
-		    ?WARNING_MSG("invalid avatar data detected "
-				 "for ~s@~s with item id ~s",
+		    ?WARNING_MSG("Invalid avatar data detected "
+				 "for ~ts@~ts with item id ~ts",
 				 [LUser, LServer, ItemID]),
 		    {error, invalid_data}
 	    catch _:{xmpp_codec, Why} ->
-		    ?WARNING_MSG("failed to decode avatar data for "
-				 "~s@~s with item id ~s: ~s",
+		    ?WARNING_MSG("Failed to decode avatar data for "
+				 "~ts@~ts with item id ~ts: ~ts",
 				 [LUser, LServer, ItemID,
 				  xmpp:format_error(Why)]),
 		    {error, invalid_data}
 	    end;
+	#pubsub_item{payload = []} ->
+	    ?WARNING_MSG("Empty avatar data detected "
+			 "for ~ts@~ts with item id ~ts",
+			 [LUser, LServer, ItemID]),
+	    {error, invalid_data};
 	{error, #stanza_error{reason = 'item-not-found'}} ->
 	    {error, notfound};
 	{error, Reason} ->
-	    ?WARNING_MSG("failed to get item for ~s@~s at node ~s "
-			 "with item id ~s: ~p",
+	    ?WARNING_MSG("Failed to get item for ~ts@~ts at node ~ts "
+			 "with item id ~ts: ~p",
 			 [LUser, LServer, ?NS_AVATAR_METADATA, ItemID, Reason]),
 	    {error, internal_error}
     end.
@@ -228,13 +249,13 @@ get_avatar_meta(#iq{from = JID}) ->
 		#avatar_meta{} = Meta ->
 		    {ok, ItemID, Meta};
 		_ ->
-		    ?WARNING_MSG("invalid metadata payload detected "
-				 "for ~s@~s with item id ~s",
+		    ?WARNING_MSG("Invalid metadata payload detected "
+				 "for ~ts@~ts with item id ~ts",
 				 [LUser, LServer, ItemID]),
 		    {error, invalid_metadata}
 	    catch _:{xmpp_codec, Why} ->
-		    ?WARNING_MSG("failed to decode metadata for "
-				 "~s@~s with item id ~s: ~s",
+		    ?WARNING_MSG("Failed to decode metadata for "
+				 "~ts@~ts with item id ~ts: ~ts",
 				 [LUser, LServer, ItemID,
 				  xmpp:format_error(Why)]),
 		    {error, invalid_metadata}
@@ -242,7 +263,7 @@ get_avatar_meta(#iq{from = JID}) ->
 	{error, #stanza_error{reason = 'item-not-found'}} ->
 	    {error, notfound};
 	{error, Reason} ->
-	    ?WARNING_MSG("failed to get items for ~s@~s at node ~s: ~p",
+	    ?WARNING_MSG("Failed to get items for ~ts@~ts at node ~ts: ~p",
 			 [LUser, LServer, ?NS_AVATAR_METADATA, Reason]),
 	    {error, internal_error}
     end.
@@ -286,12 +307,16 @@ publish_avatar(#iq{from = JID} = IQ, Meta, MimeType, Data, ItemID) ->
 		{result, _} ->
 		    IQ;
 		{error, StanzaErr} ->
-		    ?ERROR_MSG("Failed to publish avatar metadata for ~s: ~p",
+		    ?ERROR_MSG("Failed to publish avatar metadata for ~ts: ~p",
 			       [jid:encode(JID), StanzaErr]),
 		    {stop, StanzaErr}
 	    end;
+	{error, #stanza_error{reason = 'not-acceptable'} = StanzaErr} ->
+	    ?WARNING_MSG("Failed to publish avatar data for ~ts: ~p",
+			 [jid:encode(JID), StanzaErr]),
+	    {stop, StanzaErr};
 	{error, StanzaErr} ->
-	    ?ERROR_MSG("Failed to publish avatar data for ~s: ~p",
+	    ?ERROR_MSG("Failed to publish avatar data for ~ts: ~p",
 		       [jid:encode(JID), StanzaErr]),
 	    {stop, StanzaErr}
     end.
@@ -301,7 +326,7 @@ publish_avatar(#iq{from = JID} = IQ, Meta, MimeType, Data, ItemID) ->
 			    {error, eimp:error_reason() | base64_error} |
 			    pass.
 convert_avatar(LUser, LServer, VCard) ->
-    case get_converting_rules(LServer) of
+    case mod_avatar_opt:convert(LServer) of
 	[] ->
 	    pass;
 	Rules ->
@@ -313,38 +338,41 @@ convert_avatar(LUser, LServer, VCard) ->
 	    end
     end.
 
--spec convert_avatar(binary(), binary(), binary(), convert_rules()) ->
-			    {ok, eimp:img_type(), binary()} |
+-spec convert_avatar(binary(), binary(), binary(), [convert_rule()]) ->
+			    {ok, binary(), binary()} |
 			    {error, eimp:error_reason()} |
 			    pass.
 convert_avatar(LUser, LServer, Data, Rules) ->
     Type = get_type(Data),
     NewType = convert_to_type(Type, Rules),
-    if NewType == undefined orelse Type == NewType ->
+    if NewType == undefined ->
 	    pass;
        true ->
-	    ?DEBUG("Converting avatar of ~s@~s: ~s -> ~s",
+	    ?DEBUG("Converting avatar of ~ts@~ts: ~ts -> ~ts",
 		   [LUser, LServer, Type, NewType]),
-	    case eimp:convert(Data, NewType) of
+	    RateLimit = mod_avatar_opt:rate_limit(LServer),
+	    Opts = [{limit_by, {LUser, LServer}},
+		    {rate_limit, RateLimit}],
+	    case eimp:convert(Data, NewType, Opts) of
 		{ok, NewData} ->
 		    {ok, encode_mime_type(NewType), NewData};
 		{error, Reason} = Err ->
 		    ?ERROR_MSG("Failed to convert avatar of "
-			       "~s@~s (~s -> ~s): ~s",
+			       "~ts@~ts (~ts -> ~ts): ~ts",
 			       [LUser, LServer, Type, NewType,
 				eimp:format_error(Reason)]),
 		    Err
 	    end
     end.
 
--spec set_vcard_avatar(jid(), vcard_photo() | undefined, map()) -> ok.
+-spec set_vcard_avatar(jid(), vcard_photo() | undefined, avatar_id_meta()) -> ok.
 set_vcard_avatar(JID, VCardPhoto, Meta) ->
     case get_vcard(JID) of
 	{ok, #vcard_temp{photo = VCardPhoto}} ->
 	    ok;
 	{ok, VCard} ->
 	    VCard1 = VCard#vcard_temp{photo = VCardPhoto},
-	    IQ = #iq{from = JID, to = JID, id = randoms:get_string(),
+	    IQ = #iq{from = JID, to = JID, id = p1_rand:get_string(),
 		     type = set, sub_els = [VCard1], meta = Meta},
 	    LServer = JID#jid.lserver,
 	    ejabberd_hooks:run_fold(vcard_iq_set, LServer, IQ, []),
@@ -367,11 +395,11 @@ get_vcard(#jid{luser = LUser, lserver = LServer}) ->
 	#vcard_temp{} = VCard ->
 	    {ok, VCard};
 	_ ->
-	    ?ERROR_MSG("invalid vCard of ~s@~s in the database",
+	    ?ERROR_MSG("Invalid vCard of ~ts@~ts in the database",
 		       [LUser, LServer]),
 	    {error, invalid_vcard}
     catch _:{xmpp_codec, Why} ->
-	    ?ERROR_MSG("failed to decode vCard of ~s@~s: ~s",
+	    ?ERROR_MSG("Failed to decode vCard of ~ts@~ts: ~ts",
 		       [LUser, LServer, xmpp:format_error(Why)]),
 	    {error, invalid_vcard}
     end.
@@ -382,15 +410,11 @@ stop_with_error(Lang, Reason) ->
     Txt = eimp:format_error(Reason),
     {stop, xmpp:err_internal_server_error(Txt, Lang)}.
 
--spec get_converting_rules(binary()) -> convert_rules().
-get_converting_rules(LServer) ->
-    gen_mod:get_module_opt(LServer, ?MODULE, convert, []).
-
 -spec get_type(binary()) -> eimp:img_type() | unknown.
 get_type(Data) ->
     eimp:get_type(Data).
 
--spec convert_to_type(eimp:img_type() | unknown, convert_rules()) ->
+-spec convert_to_type(eimp:img_type() | unknown, [convert_rule()]) ->
 			     eimp:img_type() | undefined.
 convert_to_type(unknown, _Rules) ->
     undefined;
@@ -398,6 +422,8 @@ convert_to_type(Type, Rules) ->
     case proplists:get_value(Type, Rules) of
 	undefined ->
 	    proplists:get_value(default, Rules);
+	Type ->
+	    undefined;
 	T ->
 	    T
     end.
@@ -416,35 +442,51 @@ decode_mime_type(MimeType) ->
 encode_mime_type(Type) ->
     <<"image/", (atom_to_binary(Type, latin1))/binary>>.
 
-mod_opt_type({convert, png}) ->
-    fun(jpeg) -> jpeg;
-       (webp) -> webp;
-       (gif) -> gif
+mod_opt_type(convert) ->
+    case eimp:supported_formats() of
+	[] ->
+	    fun(_) -> econf:fail(eimp_error) end;
+	Formats ->
+	    econf:options(
+	      maps:from_list(
+		[{Type, econf:enum(Formats)}
+		 || Type <- [default|Formats]]))
     end;
-mod_opt_type({convert, webp}) ->
-    fun(jpeg) -> jpeg;
-       (png) -> png;
-       (gif) -> gif
-    end;
-mod_opt_type({convert, jpeg}) ->
-    fun(png) -> png;
-       (webp) -> webp;
-       (gif) -> gif
-    end;
-mod_opt_type({convert, gif}) ->
-    fun(png) -> png;
-       (jpeg) -> jpeg;
-       (webp) -> webp
-    end;
-mod_opt_type({convert, default}) ->
-    fun(png) -> png;
-       (webp) -> webp;
-       (jpeg) -> jpeg;
-       (gif) -> gif
-    end;
-mod_opt_type(_) ->
-    [{convert, default},
-     {convert, webp},
-     {convert, png},
-     {convert, gif},
-     {convert, jpeg}].
+mod_opt_type(rate_limit) ->
+    econf:pos_int().
+
+-spec mod_options(binary()) -> [{convert, [?MODULE:convert_rule()]} |
+				{atom(), any()}].
+mod_options(_) ->
+    [{rate_limit, 10},
+     {convert, []}].
+
+mod_doc() ->
+    #{desc =>
+          [?T("The purpose of the module is to cope with legacy and modern "
+              "XMPP clients posting avatars. The process is described in "
+              "https://xmpp.org/extensions/xep-0398.html"
+              "[XEP-0398: User Avatar to vCard-Based Avatars Conversion]."), "",
+           ?T("Also, the module supports conversion between avatar "
+              "image formats on the fly."), "",
+           ?T("The module depends on 'mod_vcard', 'mod_vcard_xupdate' and "
+              "'mod_pubsub'.")],
+      opts =>
+          [{convert,
+            #{value => "{From: To}",
+              desc =>
+                  ?T("Defines image convertion rules: the format in 'From' "
+                     "will be converted to format in 'To'. The value of 'From' "
+                     "can also be 'default', which is match-all rule. NOTE: "
+                     "the list of supported formats is detected at compile time "
+                     "depending on the image libraries installed in the system."),
+              example =>
+                    ["convert:",
+                     "  webp: jpg",
+                     "  default: png"]}},
+           {rate_limit,
+            #{value => ?T("Number"),
+              desc =>
+                  ?T("Limit any given JID by the number of avatars it is able "
+                     "to convert per minute. This is to protect the server from "
+                     "image convertion DoS. The default value is '10'.")}}]}.

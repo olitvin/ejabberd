@@ -2,7 +2,7 @@
 %%% Created : 16 Dec 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -21,50 +21,46 @@
 %%%-------------------------------------------------------------------
 -module(mod_s2s_dialback).
 -behaviour(gen_mod).
-
 -protocol({xep, 220, '1.1.1'}).
 -protocol({xep, 185, '1.0'}).
 
 %% gen_mod API
--export([start/2, stop/1, reload/3, depends/2, mod_opt_type/1]).
+-export([start/2, stop/1, reload/3, depends/2, mod_opt_type/1, mod_options/1]).
+-export([mod_doc/0]).
 %% Hooks
 -export([s2s_out_auth_result/2, s2s_out_downgraded/2,
 	 s2s_in_packet/2, s2s_out_packet/2, s2s_in_recv/3,
-	 s2s_in_features/2, s2s_out_init/2, s2s_out_closed/2]).
+	 s2s_in_features/2, s2s_out_init/2, s2s_out_closed/2,
+	 s2s_out_tls_verify/2]).
 
--include("ejabberd.hrl").
 -include("xmpp.hrl").
 -include("logger.hrl").
+-include("translate.hrl").
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 start(Host, _Opts) ->
-    case ejabberd_s2s:tls_verify(Host) of
-	true ->
-	    ?ERROR_MSG("disabling ~s for host ~s because option "
-		       "'s2s_use_starttls' is set to 'required_trusted'",
-		       [?MODULE, Host]);
-	false ->
-	    ejabberd_hooks:add(s2s_out_init, Host, ?MODULE, s2s_out_init, 50),
-	    ejabberd_hooks:add(s2s_out_closed, Host, ?MODULE, s2s_out_closed, 50),
-	    ejabberd_hooks:add(s2s_in_pre_auth_features, Host, ?MODULE,
-			       s2s_in_features, 50),
-	    ejabberd_hooks:add(s2s_in_post_auth_features, Host, ?MODULE,
-			       s2s_in_features, 50),
-	    ejabberd_hooks:add(s2s_in_handle_recv, Host, ?MODULE,
-			       s2s_in_recv, 50),
-	    ejabberd_hooks:add(s2s_in_unauthenticated_packet, Host, ?MODULE,
-			       s2s_in_packet, 50),
-	    ejabberd_hooks:add(s2s_in_authenticated_packet, Host, ?MODULE,
-			       s2s_in_packet, 50),
-	    ejabberd_hooks:add(s2s_out_packet, Host, ?MODULE,
-			       s2s_out_packet, 50),
-	    ejabberd_hooks:add(s2s_out_downgraded, Host, ?MODULE,
-			       s2s_out_downgraded, 50),
-	    ejabberd_hooks:add(s2s_out_auth_result, Host, ?MODULE,
-			       s2s_out_auth_result, 50)
-    end.
+    ejabberd_hooks:add(s2s_out_init, Host, ?MODULE, s2s_out_init, 50),
+    ejabberd_hooks:add(s2s_out_closed, Host, ?MODULE, s2s_out_closed, 50),
+    ejabberd_hooks:add(s2s_in_pre_auth_features, Host, ?MODULE,
+		       s2s_in_features, 50),
+    ejabberd_hooks:add(s2s_in_post_auth_features, Host, ?MODULE,
+		       s2s_in_features, 50),
+    ejabberd_hooks:add(s2s_in_handle_recv, Host, ?MODULE,
+		       s2s_in_recv, 50),
+    ejabberd_hooks:add(s2s_in_unauthenticated_packet, Host, ?MODULE,
+		       s2s_in_packet, 50),
+    ejabberd_hooks:add(s2s_in_authenticated_packet, Host, ?MODULE,
+		       s2s_in_packet, 50),
+    ejabberd_hooks:add(s2s_out_packet, Host, ?MODULE,
+		       s2s_out_packet, 50),
+    ejabberd_hooks:add(s2s_out_downgraded, Host, ?MODULE,
+		       s2s_out_downgraded, 50),
+    ejabberd_hooks:add(s2s_out_auth_result, Host, ?MODULE,
+		       s2s_out_auth_result, 50),
+    ejabberd_hooks:add(s2s_out_tls_verify, Host, ?MODULE,
+		       s2s_out_tls_verify, 50).
 
 stop(Host) ->
     ejabberd_hooks:delete(s2s_out_init, Host, ?MODULE, s2s_out_init, 50),
@@ -84,21 +80,55 @@ stop(Host) ->
     ejabberd_hooks:delete(s2s_out_downgraded, Host, ?MODULE,
 			  s2s_out_downgraded, 50),
     ejabberd_hooks:delete(s2s_out_auth_result, Host, ?MODULE,
-			  s2s_out_auth_result, 50).
+			  s2s_out_auth_result, 50),
+    ejabberd_hooks:delete(s2s_out_tls_verify, Host, ?MODULE,
+			  s2s_out_tls_verify, 50).
 
-reload(Host, NewOpts, _OldOpts) ->
-    case ejabberd_s2s:tls_verify(Host) of
-	false ->
-	    start(Host, NewOpts);
-	true ->
-	    stop(Host)
-    end.
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
 
 depends(_Host, _Opts) ->
     [].
 
-mod_opt_type(_) ->
-    [].
+mod_opt_type(access) ->
+    econf:acl().
+
+mod_options(_Host) ->
+    [{access, all}].
+
+mod_doc() ->
+    #{desc =>
+          [?T("The module adds support for "
+              "https://xmpp.org/extensions/xep-0220.html"
+              "[XEP-0220: Server Dialback] to provide server identity "
+              "verification based on DNS."), "",
+           ?T("WARNING: DNS-based verification is vulnerable to "
+              "https://en.wikipedia.org/wiki/DNS_spoofing"
+              "[DNS cache poisoning], so modern servers rely on "
+              "verification based on PKIX certificates. Thus this module "
+              "is only recommended for backward compatibility "
+              "with servers running outdated software or non-TLS servers, "
+              "or those with invalid certificates (as long as you accept "
+              "the risks, e.g. you assume that the remote server has "
+              "an invalid certificate due to poor administration and "
+              "not because it's compromised).")],
+      opts =>
+          [{access,
+            #{value => ?T("AccessName"),
+              desc =>
+                  ?T("An access rule that can be used to restrict "
+                     "dialback for some servers. The default value "
+                     "is 'all'.")}}],
+      example =>
+          ["modules:",
+           "  ...",
+           "  mod_s2s_dialback:",
+           "    access:",
+           "      allow:",
+           "        server: legacy.domain.tld",
+           "        server: invalid-cert.example.org",
+           "      deny: all",
+           "  ..."]}.
 
 s2s_in_features(Acc, _) ->
     [#db_feature{errors = true}|Acc].
@@ -121,13 +151,14 @@ s2s_out_init(Acc, _Opts) ->
 
 s2s_out_closed(#{server := LServer,
 		 remote_server := RServer,
+		 lang := Lang,
 		 db_verify := {StreamID, _Key, _Pid}} = State, Reason) ->
     %% Outbound s2s verificating connection (created at step 1) is
     %% closed suddenly without receiving the response.
     %% Building a response on our own
     Response = #db_verify{from = RServer, to = LServer,
 			  id = StreamID, type = error,
-			  sub_els = [mk_error(Reason)]},
+			  sub_els = [mk_error(Reason, Lang)]},
     s2s_out_packet(State, Response);
 s2s_out_closed(State, _Reason) ->
     State.
@@ -139,14 +170,13 @@ s2s_out_auth_result(#{db_verify := _} = State, _) ->
     %% in section 2.1.2, step 2
     {stop, send_verify_request(State)};
 s2s_out_auth_result(#{db_enabled := true,
-		      sockmod := SockMod,
 		      socket := Socket, ip := IP,
 		      server := LServer,
 		      remote_server := RServer} = State, {false, _}) ->
     %% SASL authentication has failed, retrying with dialback
     %% Sending dialback request, section 2.1.1, step 1
-    ?INFO_MSG("(~s) Retrying with s2s dialback authentication: ~s -> ~s (~s)",
-	      [SockMod:pp(Socket), LServer, RServer,
+    ?INFO_MSG("(~ts) Retrying with s2s dialback authentication: ~ts -> ~ts (~ts)",
+	      [xmpp_socket:pp(Socket), LServer, RServer,
 	       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
     State1 = maps:remove(stop_reason, State#{on_route => queue}),
     {stop, send_db_request(State1)};
@@ -159,21 +189,20 @@ s2s_out_downgraded(#{db_verify := _} = State, _) ->
     %% section 2.1.2, step 2
     {stop, send_verify_request(State)};
 s2s_out_downgraded(#{db_enabled := true,
-		     sockmod := SockMod,
 		     socket := Socket, ip := IP,
 		     server := LServer,
 		     remote_server := RServer} = State, _) ->
     %% non-RFC compliant server detected, send dialback request instantly,
     %% section 2.1.1, step 1
-    ?INFO_MSG("(~s) Trying s2s dialback authentication with "
-	      "non-RFC compliant server: ~s -> ~s (~s)",
-	      [SockMod:pp(Socket), LServer, RServer,
+    ?INFO_MSG("(~ts) Trying s2s dialback authentication with "
+	      "non-RFC compliant server: ~ts -> ~ts (~ts)",
+	      [xmpp_socket:pp(Socket), LServer, RServer,
 	       ejabberd_config:may_hide_data(misc:ip_to_list(IP))]),
     {stop, send_db_request(State)};
 s2s_out_downgraded(State, _) ->
     State.
 
-s2s_in_packet(#{stream_id := StreamID} = State,
+s2s_in_packet(#{stream_id := StreamID, lang := Lang} = State,
 	      #db_result{from = From, to = To, key = Key, type = undefined}) ->
     %% Received dialback request, section 2.2.1, step 1
     try
@@ -188,7 +217,7 @@ s2s_in_packet(#{stream_id := StreamID} = State,
 	    {stop,
 	     send_db_result(State,
 			    #db_verify{from = From, to = To, type = error,
-				       sub_els = [mk_error(Reason)]})}
+				       sub_els = [mk_error(Reason, Lang)]})}
     end;
 s2s_in_packet(State, #db_verify{to = To, from = From, key = Key,
 				id = StreamID, type = undefined}) ->
@@ -201,12 +230,12 @@ s2s_in_packet(State, #db_verify{to = To, from = From, key = Key,
     {stop, ejabberd_s2s_in:send(State, Response)};
 s2s_in_packet(State, Pkt) when is_record(Pkt, db_result);
 			       is_record(Pkt, db_verify) ->
-    ?WARNING_MSG("Got stray dialback packet:~n~s", [xmpp:pp(Pkt)]),
+    ?WARNING_MSG("Got stray dialback packet:~n~ts", [xmpp:pp(Pkt)]),
     State;
 s2s_in_packet(State, _) ->
     State.
 
-s2s_in_recv(State, El, {error, Why}) ->
+s2s_in_recv(#{lang := Lang} = State, El, {error, Why}) ->
     case xmpp:get_name(El) of
 	Tag when Tag == <<"db:result">>;
 		 Tag == <<"db:verify">> ->
@@ -214,7 +243,7 @@ s2s_in_recv(State, El, {error, Why}) ->
 		T when T /= <<"valid">>,
 		       T /= <<"invalid">>,
 		       T /= <<"error">> ->
-		    Err = xmpp:make_error(El, mk_error({codec_error, Why})),
+		    Err = xmpp:make_error(El, mk_error({codec_error, Why}, Lang)),
 		    {stop, ejabberd_s2s_in:send(State, Err)};
 		_ ->
 		    State
@@ -236,7 +265,8 @@ s2s_out_packet(#{server := LServer,
     ejabberd_s2s_in:update_state(
       Pid, fun(S) -> send_db_result(S, Response) end),
     %% At this point the connection is no longer needed and we can terminate it
-    ejabberd_s2s_out:stop(State);
+    ejabberd_s2s_out:stop_async(self()),
+    State;
 s2s_out_packet(#{server := LServer, remote_server := RServer} = State,
 	       #db_result{to = LServer, from = RServer,
 			  type = Type} = Result) when Type /= undefined ->
@@ -255,19 +285,27 @@ s2s_out_packet(#{server := LServer, remote_server := RServer} = State,
     end;
 s2s_out_packet(State, Pkt) when is_record(Pkt, db_result);
 				is_record(Pkt, db_verify) ->
-    ?WARNING_MSG("Got stray dialback packet:~n~s", [xmpp:pp(Pkt)]),
+    ?WARNING_MSG("Got stray dialback packet:~n~ts", [xmpp:pp(Pkt)]),
     State;
 s2s_out_packet(State, _) ->
     State.
+
+-spec s2s_out_tls_verify(boolean(), ejabberd_s2s_out:state()) -> boolean().
+s2s_out_tls_verify(_, #{server_host := ServerHost, remote_server := RServer}) ->
+    Access = mod_s2s_dialback_opt:access(ServerHost),
+    case acl:match_rule(ServerHost, Access, jid:make(RServer)) of
+	allow -> false;
+	deny -> true
+    end.
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
 -spec make_key(binary(), binary(), binary()) -> binary().
 make_key(From, To, StreamID) ->
-    Secret = ejabberd_config:get_option(shared_key),
+    Secret = ejabberd_config:get_shared_key(),
     str:to_hexlist(
-      crypto:hmac(sha256, str:to_hexlist(crypto:hash(sha256, Secret)),
+      misc:crypto_hmac(sha256, str:to_hexlist(crypto:hash(sha256, Secret)),
 		  [To, " ", From, " ", StreamID])).
 
 -spec send_verify_request(ejabberd_s2s_out:state()) -> ejabberd_s2s_out:state().
@@ -318,44 +356,28 @@ check_from_to(From, To) ->
     	    end
     end.
 
--spec mk_error(term()) -> stanza_error().
-mk_error(forbidden) ->
-    xmpp:err_forbidden(<<"Access denied by service policy">>, ?MYLANG);
-mk_error(host_unknown) ->
-    xmpp:err_not_allowed(<<"Host unknown">>, ?MYLANG);
-mk_error({codec_error, Why}) ->
-    xmpp:err_bad_request(xmpp:io_format_error(Why), ?MYLANG);
-mk_error({_Class, _Reason} = Why) ->
+-spec mk_error(term(), binary()) -> stanza_error().
+mk_error(forbidden, Lang) ->
+    xmpp:err_forbidden(?T("Access denied by service policy"), Lang);
+mk_error(host_unknown, Lang) ->
+    xmpp:err_not_allowed(?T("Host unknown"), Lang);
+mk_error({codec_error, Why}, Lang) ->
+    xmpp:err_bad_request(xmpp:io_format_error(Why), Lang);
+mk_error({_Class, _Reason} = Why, Lang) ->
     Txt = xmpp_stream_out:format_error(Why),
-    xmpp:err_remote_server_not_found(Txt, ?MYLANG);
-mk_error(_) ->
+    xmpp:err_remote_server_not_found(Txt, Lang);
+mk_error(_, _) ->
     xmpp:err_internal_server_error().
 
 -spec format_error(db_result()) -> binary().
 format_error(#db_result{type = invalid}) ->
     <<"invalid dialback key">>;
-format_error(#db_result{type = error, sub_els = Els}) ->
-    %% TODO: improve xmpp.erl
-    case xmpp:get_error(#message{sub_els = Els}) of
+format_error(#db_result{type = error} = Result) ->
+    case xmpp:get_error(Result) of
 	#stanza_error{} = Err ->
-	    format_stanza_error(Err);
+	    xmpp:format_stanza_error(Err);
 	undefined ->
 	    <<"unrecognized error">>
     end;
 format_error(_) ->
     <<"unexpected dialback result">>.
-
--spec format_stanza_error(stanza_error()) -> binary().
-format_stanza_error(#stanza_error{reason = Reason, text = Txt}) ->
-    Slogan = case Reason of
-		 undefined -> <<"no reason">>;
-		 #gone{} -> <<"gone">>;
-		 #redirect{} -> <<"redirect">>;
-		 _ -> erlang:atom_to_binary(Reason, latin1)
-	     end,
-    case Txt of
-	undefined -> Slogan;
-	#text{data = <<"">>} -> Slogan;
-	#text{data = Data} ->
-	    <<Data/binary, " (", Slogan/binary, ")">>
-    end.

@@ -5,7 +5,7 @@
 %%% Created : 11 Jan 2004 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -23,43 +23,22 @@
 %%%
 %%%----------------------------------------------------------------------
 
-%%% @headerfile "ejabberd_ctl.hrl"
-
-%%% @doc Management of ejabberdctl commands and frontend to ejabberd commands.
-%%%
-%%% An ejabberdctl command is an abstract function identified by a
-%%% name, with a defined number of calling arguments, that can be
-%%% defined in any Erlang module and executed using ejabberdctl
-%%% administration script.
-%%%
-%%% Note: strings cannot have blankspaces
-%%%
 %%% Does not support commands that have arguments with ctypes: list, tuple
-%%%
-%%% TODO: Update the guide
-%%% TODO: Mention this in the release notes
-%%% Note: the commands with several words use now the underline: _
-%%% It is still possible to call the commands with dash: -
-%%% but this is deprecated, and may be removed in a future version.
-
 
 -module(ejabberd_ctl).
 
--behaviour(ejabberd_config).
 -behaviour(gen_server).
 -author('alexey@process-one.net').
 
--export([start/0, start_link/0, process/1, process2/2,
-	 register_commands/3, unregister_commands/3,
-	 opt_type/1]).
+-export([start/0, start_link/0, process/1, process2/2]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
 -include("ejabberd_ctl.hrl").
 -include("ejabberd_commands.hrl").
--include("ejabberd.hrl").
 -include("logger.hrl").
+-include("ejabberd_stacktrace.hrl").
 
 -define(DEFAULT_VERSION, 1000000).
 
@@ -70,6 +49,7 @@
 %%-----------------------------
 
 start() ->
+    disable_logging(),
     [SNode, Timeout, Args] = case init:get_plain_arguments() of
                                  [SNode2, "--no-timeout" | Args2] ->
                                      [SNode2, infinity, Args2];
@@ -94,7 +74,7 @@ start() ->
                      end
              end,
     Node = list_to_atom(SNode1),
-    Status = case rpc:call(Node, ?MODULE, process, [Args], Timeout) of
+    Status = case ejabberd_cluster:call(Node, ?MODULE, process, [Args], Timeout) of
                  {badrpc, Reason} ->
                      print("Failed RPC connection to the node ~p: ~p~n",
                            [Node, Reason]),
@@ -112,18 +92,18 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    ets:new(ejabberd_ctl_cmds, [named_table, set, public]),
-    ets:new(ejabberd_ctl_host_cmds, [named_table, set, public]),
     {ok, #state{}}.
 
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(_Msg, State) ->
+handle_call(Request, From, State) ->
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Request]),
     {noreply, State}.
 
-handle_info(_Info, State) ->
+handle_cast(Msg, State) ->
+    ?WARNING_MSG("Unexpected cast: ~p", [Msg]),
+    {noreply, State}.
+
+handle_info(Info, State) ->
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -133,28 +113,8 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%-----------------------------
-%% ejabberdctl Command managment
-%%-----------------------------
-
-register_commands(CmdDescs, Module, Function) ->
-    ets:insert(ejabberd_ctl_cmds, CmdDescs),
-    ejabberd_hooks:add(ejabberd_ctl_process,
-		       Module, Function, 50),
-    ok.
-
-unregister_commands(CmdDescs, Module, Function) ->
-    lists:foreach(fun(CmdDesc) ->
-			  ets:delete_object(ejabberd_ctl_cmds, CmdDesc)
-		  end, CmdDescs),
-    ejabberd_hooks:delete(ejabberd_ctl_process,
-			  Module, Function, 50),
-    ok.
-
-
-%%-----------------------------
 %% Process
 %%-----------------------------
-
 
 -spec process([string()]) -> non_neg_integer().
 process(Args) ->
@@ -169,15 +129,15 @@ process(["status"], _Version) ->
     {InternalStatus, ProvidedStatus} = init:get_status(),
     print("The node ~p is ~p with status: ~p~n",
 	   [node(), InternalStatus, ProvidedStatus]),
-    case lists:keysearch(ejabberd, 1, application:which_applications()) of
+    case lists:keymember(ejabberd, 1, application:which_applications()) of
         false ->
             EjabberdLogPath = ejabberd_logger:get_log_path(),
             print("ejabberd is not running in that node~n"
-		   "Check for error messages: ~s~n"
+		   "Check for error messages: ~ts~n"
 		   "or other files in that directory.~n", [EjabberdLogPath]),
             ?STATUS_ERROR;
-        {value, {_, _, Version}} ->
-            print("ejabberd ~s is running in that node~n", [Version]),
+        true ->
+            print("ejabberd ~ts is running in that node~n", [ejabberd_option:version()]),
             ?STATUS_SUCCESS
     end;
 
@@ -190,6 +150,9 @@ process(["restart"], _Version) ->
     init:restart(),
     ?STATUS_SUCCESS;
 
+%% TODO: Mnesia operations should not be hardcoded in ejabberd_ctl module.
+%% For now, I leave them there to avoid breaking those commands for people that
+%% may be using it (as format of response is going to change).
 process(["mnesia"], _Version) ->
     print("~p~n", [mnesia:system_info(all)]),
     ?STATUS_SUCCESS;
@@ -245,12 +208,11 @@ process(["--version", Arg | Args], _) ->
     process(Args, Version);
 
 process(Args, Version) ->
-    AccessCommands = get_accesscommands(),
-    {String, Code} = process2(Args, AccessCommands, Version),
+    {String, Code} = process2(Args, [], Version),
     case String of
 	[] -> ok;
 	_ ->
-	    io:format("~s~n", [String])
+	    io:format("~ts~n", [String])
     end,
     Code.
 
@@ -288,14 +250,11 @@ process2(Args, AccessCommands, Auth, Version) ->
 	    {"Erroneous result: " ++ io_lib:format("~p", [Other]), ?STATUS_ERROR}
     end.
 
-get_accesscommands() ->
-    ejabberd_config:get_option(ejabberdctl_access_commands, []).
-
 %%-----------------------------
 %% Command calling
 %%-----------------------------
 
-%% @spec (Args::[string()], Auth, AccessCommands) -> string() | integer() | {string(), integer()}
+%% @spec (Args::[string()], Auth, AccessCommands, Version) -> string() | integer() | {string(), integer()}
 try_run_ctp(Args, Auth, AccessCommands, Version) ->
     try ejabberd_hooks:run_fold(ejabberd_ctl_process, false, [Args]) of
 	false when Args /= [] ->
@@ -316,54 +275,57 @@ try_run_ctp(Args, Auth, AccessCommands, Version) ->
 	    {io_lib:format("Error in ejabberd ctl process: '~p' ~p", [Error, Why]), ?STATUS_USAGE}
     end.
 
-%% @spec (Args::[string()], Auth, AccessCommands) -> string() | integer() | {string(), integer()}
+%% @spec (Args::[string()], Auth, AccessCommands, Version) -> string() | integer() | {string(), integer()}
 try_call_command(Args, Auth, AccessCommands, Version) ->
     try call_command(Args, Auth, AccessCommands, Version) of
-	{error, command_unknown} ->
-	    {io_lib:format("Error: command ~p not known.", [hd(Args)]), ?STATUS_ERROR};
-	{error, wrong_command_arguments} ->
-	    {"Error: wrong arguments", ?STATUS_ERROR};
+	{Reason, wrong_command_arguments} ->
+	    {Reason, ?STATUS_ERROR};
 	Res ->
 	    Res
     catch
+	throw:{error, unknown_command} ->
+	    KnownCommands = [Cmd || {Cmd, _, _} <- ejabberd_commands:list_commands(Version)],
+	    UnknownCommand = list_to_atom(hd(Args)),
+	    {io_lib:format(
+	       "Error: unknown command '~ts'. Did you mean '~ts'?",
+	       [hd(Args), misc:best_match(UnknownCommand, KnownCommands)]),
+	     ?STATUS_ERROR};
 	throw:Error ->
 	    {io_lib:format("~p", [Error]), ?STATUS_ERROR};
-	A:Why ->
-	    Stack = erlang:get_stacktrace(),
-	    {io_lib:format("Problem '~p ~p' occurred executing the command.~nStacktrace: ~p", [A, Why, Stack]), ?STATUS_ERROR}
+	?EX_RULE(A, Why, Stack) ->
+	    StackTrace = ?EX_STACK(Stack),
+	    {io_lib:format("Unhandled exception occurred executing the command:~n** ~ts",
+			   [misc:format_exception(2, A, Why, StackTrace)]),
+	     ?STATUS_ERROR}
     end.
 
-%% @spec (Args::[string()], Auth, AccessCommands) -> string() | integer() | {string(), integer()} | {error, ErrorType}
+%% @spec (Args::[string()], Auth, AccessCommands, Version) -> string() | integer() | {string(), integer()} | {error, ErrorType}
 call_command([CmdString | Args], Auth, _AccessCommands, Version) ->
     CmdStringU = ejabberd_regexp:greplace(
                    list_to_binary(CmdString), <<"-">>, <<"_">>),
     Command = list_to_atom(binary_to_list(CmdStringU)),
-    case ejabberd_commands:get_command_format(Command, Auth, Version) of
-	{error, command_unknown} ->
-	    {error, command_unknown};
-	{ArgsFormat, ResultFormat} ->
-	    case (catch format_args(Args, ArgsFormat)) of
-		ArgsFormatted when is_list(ArgsFormatted) ->
-		    CI = case Auth of
-			     {U, S, _, _} -> #{usr => {U, S, <<"">>}, caller_host => S};
-			     _ -> #{}
-			 end,
-		    CI2 = CI#{caller_module => ?MODULE},
-		    Result = ejabberd_commands:execute_command2(Command,
-								ArgsFormatted,
-								CI2,
-								Version),
-		    format_result(Result, ResultFormat);
-		{'EXIT', {function_clause,[{lists,zip,[A1, A2], _} | _]}} ->
-		    {NumCompa, TextCompa} =
-			case {length(A1), length(A2)} of
-			    {L1, L2} when L1 < L2 -> {L2-L1, "less argument"};
-			    {L1, L2} when L1 > L2 -> {L1-L2, "more argument"}
-			end,
-		    {io_lib:format("Error: the command ~p requires ~p ~s.",
-				   [CmdString, NumCompa, TextCompa]),
-		     wrong_command_arguments}
-	    end
+    {ArgsFormat, _, ResultFormat} = ejabberd_commands:get_command_format(Command, Auth, Version),
+    case (catch format_args(Args, ArgsFormat)) of
+	ArgsFormatted when is_list(ArgsFormatted) ->
+	    CI = case Auth of
+		     {U, S, _, _} -> #{usr => {U, S, <<"">>}, caller_host => S};
+		     _ -> #{}
+		 end,
+	    CI2 = CI#{caller_module => ?MODULE},
+	    Result = ejabberd_commands:execute_command2(Command,
+							ArgsFormatted,
+							CI2,
+							Version),
+	    format_result(Result, ResultFormat);
+	{'EXIT', {function_clause,[{lists,zip,[A1, A2], _} | _]}} ->
+	    {NumCompa, TextCompa} =
+		case {length(A1), length(A2)} of
+		    {L1, L2} when L1 < L2 -> {L2-L1, "less argument"};
+		    {L1, L2} when L1 > L2 -> {L1-L2, "more argument"}
+		end,
+	    {io_lib:format("Error: the command ~p requires ~p ~ts.",
+			   [CmdString, NumCompa, TextCompa]),
+	     wrong_command_arguments}
     end.
 
 
@@ -415,16 +377,16 @@ format_result(Int, {_Name, integer}) ->
     io_lib:format("~p", [Int]);
 
 format_result([A|_]=String, {_Name, string}) when is_list(String) and is_integer(A) ->
-    io_lib:format("~s", [String]);
+    io_lib:format("~ts", [String]);
 
 format_result(Binary, {_Name, string}) when is_binary(Binary) ->
-    io_lib:format("~s", [binary_to_list(Binary)]);
+    io_lib:format("~ts", [binary_to_list(Binary)]);
 
 format_result(Atom, {_Name, string}) when is_atom(Atom) ->
-    io_lib:format("~s", [atom_to_list(Atom)]);
+    io_lib:format("~ts", [atom_to_list(Atom)]);
 
 format_result(Integer, {_Name, string}) when is_integer(Integer) ->
-    io_lib:format("~s", [integer_to_list(Integer)]);
+    io_lib:format("~ts", [integer_to_list(Integer)]);
 
 format_result(Other, {_Name, string})  ->
     io_lib:format("~p", [Other]);
@@ -433,7 +395,7 @@ format_result(Code, {_Name, rescode}) ->
     make_status(Code);
 
 format_result({Code, Text}, {_Name, restuple}) ->
-    {io_lib:format("~s", [Text]), make_status(Code)};
+    {io_lib:format("~ts", [Text]), make_status(Code)};
 
 %% The result is a list of something: [something()]
 format_result([], {_Name, {list, _ElementsDef}}) ->
@@ -469,7 +431,9 @@ make_status(ok) -> ?STATUS_SUCCESS;
 make_status(true) -> ?STATUS_SUCCESS;
 make_status(Code) when is_integer(Code), Code > 255 -> ?STATUS_ERROR;
 make_status(Code) when is_integer(Code), Code > 0 -> Code;
-make_status(_Error) -> ?STATUS_ERROR.
+make_status(Error) ->
+    io:format("Error: ~p~n", [Error]),
+    ?STATUS_ERROR.
 
 get_list_commands(Version) ->
     try ejabberd_commands:list_commands(Version) of
@@ -486,7 +450,7 @@ get_list_commands(Version) ->
 
 %% Return: {string(), [string()], string()}
 tuple_command_help({Name, _Args, Desc}) ->
-    {Args, _} = ejabberd_commands:get_command_format(Name, admin),
+    {Args, _, _} = ejabberd_commands:get_command_format(Name, admin),
     Arguments = [atom_to_list(ArgN) || {ArgN, _ArgF} <- Args],
     Prepend = case is_supported_args(Args) of
 		  true -> "";
@@ -503,13 +467,6 @@ is_supported_args(Args) ->
 		      or (Format == binary)
       end,
       Args).
-
-get_list_ctls() ->
-    case catch ets:tab2list(ejabberd_ctl_cmds) of
-	{'EXIT', _} -> [];
-	Cs -> [{NameArgs, [], Desc} || {NameArgs, Desc} <- Cs]
-    end.
-
 
 %%-----------------------------
 %% Print help
@@ -536,8 +493,7 @@ print_usage(HelpMode, MaxC, ShCode, Version) ->
 	 {"restart", [], "Restart ejabberd"},
 	 {"help", ["[--tags [tag] | com?*]"], "Show help (try: ejabberdctl help help)"},
 	 {"mnesia", ["[info]"], "show information of Mnesia system"}] ++
-	get_list_commands(Version) ++
-	get_list_ctls(),
+	get_list_commands(Version),
 
     print(
        ["Usage: ", ?B("ejabberdctl"), " [--no-timeout] [--node ", ?U("nodename"), "] [--version ", ?U("api_version"), "] ",
@@ -727,18 +683,19 @@ print_usage_help(MaxC, ShCode) ->
 	 "Those commands can be identified because the description starts with: *"],
     ArgsDef = [],
     C = #ejabberd_commands{
-      desc = "Show help of ejabberd commands",
-      longdesc = lists:flatten(LongDesc),
-      args = ArgsDef,
-      result = {help, string}},
-    print_usage_command("help", C, MaxC, ShCode).
+	   name = help,
+	   desc = "Show help of ejabberd commands",
+	   longdesc = lists:flatten(LongDesc),
+	   args = ArgsDef,
+	   result = {help, string}},
+    print_usage_command2("help", C, MaxC, ShCode).
 
 
 %%-----------------------------
 %% Print usage command
 %%-----------------------------
 
-%% @spec (CmdSubString::string(), MaxC::integer(), ShCode::boolean()) -> ok
+%% @spec (CmdSubString::string(), MaxC::integer(), ShCode::boolean(), Version) -> ok
 print_usage_commands2(CmdSubString, MaxC, ShCode, Version) ->
     %% Get which command names match this substring
     AllCommandsNames = [atom_to_list(Name) || {Name, _, _} <- ejabberd_commands:list_commands(Version)],
@@ -781,15 +738,11 @@ filter_commands_regexp(All, Glob) ->
       end,
       All).
 
-%% @spec (Cmd::string(), MaxC::integer(), ShCode::boolean()) -> ok
+%% @spec (Cmd::string(), MaxC::integer(), ShCode::boolean(), Version) -> ok
 print_usage_command(Cmd, MaxC, ShCode, Version) ->
     Name = list_to_atom(Cmd),
-    case ejabberd_commands:get_command_definition(Name, Version) of
-	command_not_found ->
-	    io:format("Error: command ~p not known.~n", [Cmd]);
-	C ->
-	    print_usage_command2(Cmd, C, MaxC, ShCode)
-    end.
+    C = ejabberd_commands:get_command_definition(Name, Version),
+    print_usage_command2(Cmd, C, MaxC, ShCode).
 
 print_usage_command2(Cmd, C, MaxC, ShCode) ->
     #ejabberd_commands{
@@ -801,7 +754,7 @@ print_usage_command2(Cmd, C, MaxC, ShCode) ->
     NameFmt = ["  ", ?B("Command Name"), ": ", Cmd, "\n"],
 
     %% Initial indentation of result is 13 = length("  Arguments: ")
-    {ArgsDef, _} = ejabberd_commands:get_command_format(
+    {ArgsDef, _, _} = ejabberd_commands:get_command_format(
                      C#ejabberd_commands.name, admin),
     Args = [format_usage_ctype(ArgDef, 13) || ArgDef <- ArgsDef],
     ArgsMargin = lists:duplicate(13, $\s),
@@ -865,18 +818,10 @@ format_usage_tuple([ElementDef | ElementsDef], Indentation) ->
 print(Format, Args) ->
     io:format(lists:flatten(Format), Args).
 
-%%-----------------------------
-%% Command managment
-%%-----------------------------
-
-%%+++
-%% Struct(Integer res) create_account(Struct(String user, String server, String password))
-%%format_usage_xmlrpc(ArgsDef, ResultDef) ->
-%%    ["aaaa bbb ccc"].
-
-
--spec opt_type(ejabberdctl_access_commands) -> fun((list()) -> list());
-	      (atom()) -> [atom()].
-opt_type(ejabberdctl_access_commands) ->
-    fun (V) when is_list(V) -> V end;
-opt_type(_) -> [ejabberdctl_access_commands].
+-ifdef(LAGER).
+disable_logging() ->
+    ok.
+-else.
+disable_logging() ->
+    logger:set_primary_config(level, none).
+-endif.

@@ -4,7 +4,7 @@
 %%% Purpose : Bytestream process.
 %%% Created : 12 Oct 2006 by Evgeniy Khramtsov <xram@jabber.ru>
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,22 +27,22 @@
 -author('xram@jabber.ru').
 
 -behaviour(p1_fsm).
+-behaviour(ejabberd_listener).
 
 %% gen_fsm callbacks.
 -export([init/1, handle_event/3, handle_sync_event/4,
 	 code_change/4, handle_info/3, terminate/3]).
 
 %% gen_fsm states.
--export([wait_for_init/2, wait_for_auth/2,
+-export([accepting/2, wait_for_init/2, wait_for_auth/2,
 	 wait_for_request/2, wait_for_activation/2,
 	 stream_established/2]).
 
--export([start/2, stop/1, start_link/3, activate/2,
-	 relay/3, socket_type/0, listen_opt_type/1]).
+-export([start/3, stop/1, start_link/3, activate/2,
+	 relay/3, accept/1, listen_options/0]).
 
 -include("mod_proxy65.hrl").
 
--include("ejabberd.hrl").
 -include("logger.hrl").
 
 -define(WAIT_TIMEOUT, 60000).
@@ -53,7 +53,7 @@
          sha1 = <<"">> :: binary(),
          host = <<"">> :: binary(),
          auth_type = anonymous :: plain | anonymous,
-         shaper = none :: shaper:shaper()}).
+         shaper = none :: ejabberd_shaper:shaper()}).
 
 %% Unused callbacks
 handle_event(_Event, StateName, StateData) ->
@@ -64,29 +64,23 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 
 %%-------------------------------
 
-start({gen_tcp, Socket}, Opts1) ->
-    {[{server_host, Host}], Opts} = lists:partition(
-				      fun({server_host, _}) -> true;
-					 (_) -> false
-				      end, Opts1),
-    Supervisor = gen_mod:get_module_proc(Host,
-					 ejabberd_mod_proxy65_sup),
-    supervisor:start_child(Supervisor,
-			   [Socket, Host, Opts]).
+start(gen_tcp, Socket, Opts) ->
+    Host = proplists:get_value(server_host, Opts),
+    p1_fsm:start(?MODULE, [Socket, Host], []).
 
-start_link(Socket, Host, Opts) ->
-    p1_fsm:start_link(?MODULE, [Socket, Host, Opts], []).
+start_link(gen_tcp, Socket, Opts) ->
+    Host = proplists:get_value(server_host, Opts),
+    p1_fsm:start_link(?MODULE, [Socket, Host], []).
 
-init([Socket, Host, Opts]) ->
+init([Socket, Host]) ->
     process_flag(trap_exit, true),
-    AuthType = gen_mod:get_opt(auth_type, Opts, anonymous),
-    Shaper = gen_mod:get_opt(shaper, Opts, none),
-    RecvBuf = gen_mod:get_opt(recbuf, Opts, 8192),
-    SendBuf = gen_mod:get_opt(sndbuf, Opts, 8192),
+    AuthType = mod_proxy65_opt:auth_type(Host),
+    Shaper = mod_proxy65_opt:shaper(Host),
+    RecvBuf = mod_proxy65_opt:recbuf(Host),
+    SendBuf = mod_proxy65_opt:sndbuf(Host),
     TRef = erlang:send_after(?WAIT_TIMEOUT, self(), stop),
-    inet:setopts(Socket,
-		 [{active, true}, {recbuf, RecvBuf}, {sndbuf, SendBuf}]),
-    {ok, wait_for_init,
+    inet:setopts(Socket, [{recbuf, RecvBuf}, {sndbuf, SendBuf}]),
+    {ok, accepting,
      #state{host = Host, auth_type = AuthType,
 	    socket = Socket, shaper = Shaper, timer = TRef}}.
 
@@ -101,7 +95,8 @@ terminate(_Reason, StateName, #state{sha1 = SHA1}) ->
 %%%------------------------------
 %%% API.
 %%%------------------------------
-socket_type() -> raw.
+accept(StreamPid) ->
+    p1_fsm:send_event(StreamPid, accept).
 
 stop(StreamPid) -> StreamPid ! stop.
 
@@ -115,8 +110,8 @@ activate({P1, J1}, {P2, J2}) ->
 	  P2 ! {activate, P1, S1, J1, J2},
 	  JID1 = jid:encode(J1),
 	  JID2 = jid:encode(J2),
-	  ?INFO_MSG("(~w:~w) Activated bytestream for ~s "
-		    "-> ~s",
+	  ?INFO_MSG("(~w:~w) Activated bytestream for ~ts "
+		    "-> ~ts",
 		    [P1, P2, JID1, JID2]),
 	  ok;
       _ -> error
@@ -125,6 +120,10 @@ activate({P1, J1}, {P2, J2}) ->
 %%%-----------------------
 %%% States
 %%%-----------------------
+accepting(accept, State) ->
+    inet:setopts(State#state.socket, [{active, true}]),
+    {next_state, wait_for_init, State}.
+
 wait_for_init(Packet,
 	      #state{socket = Socket, auth_type = AuthType} =
 		  StateData) ->
@@ -195,7 +194,7 @@ stream_established(_Data, StateData) ->
 %% SOCKS5 packets.
 handle_info({tcp, _S, Data}, StateName, StateData)
     when StateName /= wait_for_activation ->
-    erlang:cancel_timer(StateData#state.timer),
+    misc:cancel_timer(StateData#state.timer),
     TRef = erlang:send_after(?WAIT_TIMEOUT, self(), stop),
     p1_fsm:send_event(self(), Data),
     {next_state, StateName, StateData#state{timer = TRef}};
@@ -203,7 +202,7 @@ handle_info({tcp, _S, Data}, StateName, StateData)
 handle_info({activate, PeerPid, PeerSocket, IJid, TJid},
 	    wait_for_activation, StateData) ->
     erlang:monitor(process, PeerPid),
-    erlang:cancel_timer(StateData#state.timer),
+    misc:cancel_timer(StateData#state.timer),
     MySocket = StateData#state.socket,
     Shaper = StateData#state.shaper,
     Host = StateData#state.host,
@@ -245,14 +244,19 @@ handle_sync_event(_Event, _From, StateName,
 %%%-------------------------------------------------
 relay(MySocket, PeerSocket, Shaper) ->
     case gen_tcp:recv(MySocket, 0) of
-      {ok, Data} ->
-	  gen_tcp:send(PeerSocket, Data),
-	  {NewShaper, Pause} = shaper:update(Shaper, byte_size(Data)),
-	  if Pause > 0 -> timer:sleep(Pause);
-	     true -> pass
-	  end,
-	  relay(MySocket, PeerSocket, NewShaper);
-      _ -> stopped
+	{ok, Data} ->
+	    case gen_tcp:send(PeerSocket, Data) of
+		ok ->
+		    {NewShaper, Pause} = ejabberd_shaper:update(Shaper, byte_size(Data)),
+		    if Pause > 0 -> timer:sleep(Pause);
+		       true -> pass
+		    end,
+		    relay(MySocket, PeerSocket, NewShaper);
+		{error, _} = Err ->
+		    Err
+	    end;
+	{error, _} = Err ->
+	    Err
     end.
 
 %%%------------------------
@@ -271,28 +275,13 @@ select_auth_method(anonymous, AuthMethods) ->
 
 %% Obviously, we must use shaper with maximum rate.
 find_maxrate(Shaper, JID1, JID2, Host) ->
-    MaxRate1 = case acl:match_rule(Host, Shaper, JID1) of
-                   deny -> none;
-                   R1 -> shaper:new(R1)
-               end,
-    MaxRate2 = case acl:match_rule(Host, Shaper, JID2) of
-                   deny -> none;
-                   R2 -> shaper:new(R2)
-               end,
-    if MaxRate1 == none; MaxRate2 == none -> none;
-       true -> lists:max([MaxRate1, MaxRate2])
-    end.
+    R1 = ejabberd_shaper:match(Host, Shaper, JID1),
+    R2 = ejabberd_shaper:match(Host, Shaper, JID2),
+    R = case ejabberd_shaper:get_max_rate(R1) >= ejabberd_shaper:get_max_rate(R2) of
+	    true -> R1;
+	    false -> R2
+	end,
+    ejabberd_shaper:new(R).
 
-listen_opt_type(server_host) ->
-    fun iolist_to_binary/1;
-listen_opt_type(auth_type) ->
-    fun (plain) -> plain;
-	(anonymous) -> anonymous
-    end;
-listen_opt_type(recbuf) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-listen_opt_type(shaper) -> fun acl:shaper_rules_validator/1;
-listen_opt_type(sndbuf) ->
-    fun (I) when is_integer(I), I > 0 -> I end;
-listen_opt_type(_) ->
-    [auth_type, recbuf, sndbuf, shaper].
+listen_options() ->
+    [].

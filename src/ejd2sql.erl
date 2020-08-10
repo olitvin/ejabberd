@@ -5,7 +5,7 @@
 %%% Created : 22 Aug 2005 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -51,7 +51,6 @@ modules() ->
     [ejabberd_auth,
      mod_announce,
      mod_caps,
-     mod_irc,
      mod_last,
      mod_mam,
      mod_muc,
@@ -59,6 +58,7 @@ modules() ->
      mod_privacy,
      mod_private,
      mod_pubsub,
+     mod_push,
      mod_roster,
      mod_shared_roster,
      mod_vcard].
@@ -73,18 +73,28 @@ export(Server, Output) ->
       end, Modules),
     close_output(Output, IO).
 
-export(Server, Output, Module) ->
+export(Server, Output, Module1) ->
+    Module = case Module1 of
+		 mod_pubsub -> pubsub_db;
+		 _ -> Module1
+	     end,
+    SQLMod = gen_mod:db_mod(sql, Module),
     LServer = jid:nameprep(iolist_to_binary(Server)),
     IO = prepare_output(Output),
     lists:foreach(
       fun({Table, ConvertFun}) ->
               case export(LServer, Table, IO, ConvertFun) of
                   {atomic, ok} -> ok;
+		  {aborted, {no_exists, _}} ->
+		      ?WARNING_MSG("Ignoring export for module ~ts: "
+				   "Mnesia table ~ts doesn't exist (most likely "
+				   "because the module is unused)",
+				   [Module1, Table]);
                   {aborted, Reason} ->
                       ?ERROR_MSG("Failed export for module ~p and table ~p: ~p",
                                  [Module, Table, Reason])
               end
-      end, Module:export(Server)),
+      end, SQLMod:export(Server)),
     close_output(Output, IO).
 
 delete(Server) ->
@@ -104,7 +114,7 @@ delete(Server, Module) ->
 import(Server, Dir, ToType) ->
     lists:foreach(
       fun(Mod) ->
-              ?INFO_MSG("importing ~p...", [Mod]),
+              ?INFO_MSG("Importing ~p...", [Mod]),
               import(Mod, Server, Dir, ToType)
       end, modules()).
 
@@ -123,9 +133,9 @@ import(Mod, Server, Dir, ToType) ->
                   {error, enoent} ->
                       ok;
                   eof ->
-                      ?INFO_MSG("It seems like SQL dump ~s is empty", [FileName]);
+                      ?INFO_MSG("It seems like SQL dump ~ts is empty", [FileName]);
                   Err ->
-                      ?ERROR_MSG("Failed to open SQL dump ~s: ~s",
+                      ?ERROR_MSG("Failed to open SQL dump ~ts: ~ts",
                                  [FileName, format_error(Err)])
               end
       end, import_info(Mod)),
@@ -206,6 +216,10 @@ prepare_output(FileName, normal) when is_list(FileName) ->
     case file:open(FileName, [write, raw]) of
         {ok, Fd} ->
             Fd;
+        {error, eacces} ->
+            exit({"Not enough permission to the file or path", FileName});
+        {error, enoent} ->
+            exit({"Path does not exist", FileName});
         Err ->
             exit(Err)
     end;
@@ -246,7 +260,7 @@ import_rows(LServer, FromType, ToType, Tab, Mod, Dump, FieldsNumber) ->
         eof ->
             ok;
         Err ->
-            ?ERROR_MSG("Failed to read row from SQL dump: ~s",
+            ?ERROR_MSG("Failed to read row from SQL dump: ~ts",
                        [format_error(Err)])
     end.
 

@@ -5,7 +5,7 @@
 %%% Created : 20 Jul 2011 by Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -23,20 +23,18 @@
 %%%
 %%%-------------------------------------------------------------------
 -module(ejabberd_bosh).
-
+-behaviour(xmpp_socket).
+-behaviour(p1_fsm).
 -protocol({xep, 124, '1.11'}).
 -protocol({xep, 206, '1.4'}).
-
--behaviour(p1_fsm).
 
 %% API
 -export([start/2, start/3, start_link/3]).
 
 -export([send_xml/2, setopts/2, controlling_process/2,
-	 migrate/3, custom_receiver/1, become_controller/2,
-	 reset_stream/1, change_shaper/2, monitor/1, close/1,
+	 reset_stream/1, change_shaper/2, close/1,
 	 sockname/1, peername/1, process_request/3, send/2,
-	 change_controller/2]).
+	 get_transport/1, get_owner/1]).
 
 %% gen_fsm callbacks
 -export([init/1, wait_for_session/2, wait_for_session/3,
@@ -44,13 +42,9 @@
 	 handle_sync_event/4, handle_info/3, terminate/3,
 	 code_change/4]).
 
--include("ejabberd.hrl").
 -include("logger.hrl").
-
 -include("xmpp.hrl").
-
 -include("ejabberd_http.hrl").
-
 -include("bosh.hrl").
 
 %%-define(DBGFSM, true).
@@ -71,15 +65,11 @@
 -define(NS_HTTP_BIND,
 	<<"http://jabber.org/protocol/httpbind">>).
 
--define(DEFAULT_MAXPAUSE, 120).
-
 -define(DEFAULT_WAIT, 300).
 
 -define(DEFAULT_HOLD, 1).
 
 -define(DEFAULT_POLLING, 2).
-
--define(DEFAULT_INACTIVITY, 30).
 
 -define(MAX_SHAPED_REQUESTS_QUEUE_LEN, 1000).
 
@@ -96,19 +86,19 @@
          sid = <<"">>                             :: binary(),
          el_ibuf                                  :: p1_queue:queue(),
          el_obuf                                  :: p1_queue:queue(),
-         shaper_state = none                      :: shaper:shaper(),
+         shaper_state = none                      :: ejabberd_shaper:shaper(),
          c2s_pid                                  :: pid() | undefined,
 	 xmpp_ver = <<"">>                        :: binary(),
          inactivity_timer                         :: reference() | undefined,
          wait_timer                               :: reference() | undefined,
-	 wait_timeout = ?DEFAULT_WAIT             :: timeout(),
-         inactivity_timeout = ?DEFAULT_INACTIVITY :: timeout(),
+	 wait_timeout = ?DEFAULT_WAIT             :: pos_integer(),
+         inactivity_timeout                       :: pos_integer(),
 	 prev_rid = 0                             :: non_neg_integer(),
          prev_key = <<"">>                        :: binary(),
          prev_poll                                :: erlang:timestamp() | undefined,
          max_concat = unlimited                   :: unlimited | non_neg_integer(),
-	 responses = gb_trees:empty()             :: ?TGB_TREE,
-	 receivers = gb_trees:empty()             :: ?TGB_TREE,
+	 responses = gb_trees:empty()             :: gb_trees:tree(),
+	 receivers = gb_trees:empty()             :: gb_trees:tree(),
 	 shaped_receivers                         :: p1_queue:queue(),
          ip                                       :: inet:ip_address(),
          max_requests = 1                         :: non_neg_integer()}).
@@ -175,24 +165,11 @@ setopts({http_bind, FsmRef, _IP}, Opts) ->
 
 controlling_process(_Socket, _Pid) -> ok.
 
-custom_receiver({http_bind, FsmRef, _IP}) ->
-    {receiver, ?MODULE, FsmRef}.
-
-become_controller(FsmRef, C2SPid) ->
-    p1_fsm:send_all_state_event(FsmRef,
-				    {become_controller, C2SPid}).
-
-change_controller({http_bind, FsmRef, _IP}, C2SPid) ->
-    become_controller(FsmRef, C2SPid).
-
-reset_stream({http_bind, _FsmRef, _IP}) -> ok.
+reset_stream({http_bind, _FsmRef, _IP} = Socket) ->
+    Socket.
 
 change_shaper({http_bind, FsmRef, _IP}, Shaper) ->
-    p1_fsm:send_all_state_event(FsmRef,
-				    {change_shaper, Shaper}).
-
-monitor({http_bind, FsmRef, _IP}) ->
-    erlang:monitor(process, FsmRef).
+    p1_fsm:send_all_state_event(FsmRef, {change_shaper, Shaper}).
 
 close({http_bind, FsmRef, _IP}) ->
     catch p1_fsm:sync_send_all_state_event(FsmRef,
@@ -202,10 +179,11 @@ sockname(_Socket) -> {ok, {{0, 0, 0, 0}, 0}}.
 
 peername({http_bind, _FsmRef, IP}) -> {ok, IP}.
 
-migrate(FsmRef, Node, After) when node(FsmRef) == node() ->
-    catch erlang:send_after(After, FsmRef, {migrate, Node});
-migrate(_FsmRef, _Node, _After) ->
-    ok.
+get_transport(_Socket) ->
+    http_bind.
+
+get_owner({http_bind, FsmRef, _IP}) ->
+    FsmRef.
 
 process_request(Data, IP, Type) ->
     Opts1 = ejabberd_c2s_config:get_c2s_limits(),
@@ -292,12 +270,11 @@ init([#body{attrs = Attrs}, IP, SID]) ->
     Opts1 = ejabberd_c2s_config:get_c2s_limits(),
     Opts2 = [{xml_socket, true} | Opts1],
     Shaper = none,
-    ShaperState = shaper:new(Shaper),
+    ShaperState = ejabberd_shaper:new(Shaper),
     Socket = make_socket(self(), IP),
     XMPPVer = get_attr('xmpp:version', Attrs),
     XMPPDomain = get_attr(to, Attrs),
-    {InBuf, Opts} = case gen_mod:get_module_opt(
-                           XMPPDomain, mod_bosh, prebind, false) of
+    {InBuf, Opts} = case mod_bosh_opt:prebind(XMPPDomain) of
                         true ->
                             JID = make_random_jid(XMPPDomain),
                             {buf_new(XMPPDomain), [{jid, JID} | Opts2]};
@@ -306,43 +283,40 @@ init([#body{attrs = Attrs}, IP, SID]) ->
                                     buf_new(XMPPDomain)),
                              Opts2}
 		    end,
-    ejabberd_socket:start(ejabberd_c2s, ?MODULE, Socket,
-			  Opts),
-    Inactivity = gen_mod:get_module_opt(XMPPDomain,
-					mod_bosh, max_inactivity,
-					?DEFAULT_INACTIVITY),
-    MaxConcat = gen_mod:get_module_opt(XMPPDomain, mod_bosh, max_concat,
-                                       unlimited),
-    ShapedReceivers = buf_new(XMPPDomain, ?MAX_SHAPED_REQUESTS_QUEUE_LEN),
-    State = #state{host = XMPPDomain, sid = SID, ip = IP,
-		   xmpp_ver = XMPPVer, el_ibuf = InBuf,
-		   max_concat = MaxConcat, el_obuf = buf_new(XMPPDomain),
-		   inactivity_timeout = Inactivity,
-		   shaped_receivers = ShapedReceivers,
-		   shaper_state = ShaperState},
-    NewState = restart_inactivity_timer(State),
-    mod_bosh:open_session(SID, self()),
-    {ok, wait_for_session, NewState};
-init([StateName, State]) ->
-    mod_bosh:open_session(State#state.sid, self()),
-    case State#state.c2s_pid of
-      C2SPid when is_pid(C2SPid) ->
-	  NewSocket = make_socket(self(), State#state.ip),
-	  C2SPid ! {change_socket, NewSocket},
-	  NewState = restart_inactivity_timer(State),
-	  {ok, StateName, NewState};
-      _ -> {stop, normal}
+    case ejabberd_c2s:start(?MODULE, Socket, [{receiver, self()}|Opts]) of
+	{ok, C2SPid} ->
+	    ejabberd_c2s:accept(C2SPid),
+	    Inactivity = mod_bosh_opt:max_inactivity(XMPPDomain) div 1000,
+	    MaxConcat = mod_bosh_opt:max_concat(XMPPDomain),
+	    ShapedReceivers = buf_new(XMPPDomain, ?MAX_SHAPED_REQUESTS_QUEUE_LEN),
+	    State = #state{host = XMPPDomain, sid = SID, ip = IP,
+			   xmpp_ver = XMPPVer, el_ibuf = InBuf,
+			   max_concat = MaxConcat, el_obuf = buf_new(XMPPDomain),
+			   inactivity_timeout = Inactivity,
+			   shaped_receivers = ShapedReceivers,
+			   shaper_state = ShaperState},
+	    NewState = restart_inactivity_timer(State),
+	    case mod_bosh:open_session(SID, self()) of
+		ok ->
+		    {ok, wait_for_session, NewState};
+		{error, Reason} ->
+		    {stop, Reason}
+	    end;
+	{error, Reason} ->
+	    {stop, Reason};
+	ignore ->
+	    ignore
     end.
 
 wait_for_session(_Event, State) ->
-    ?ERROR_MSG("unexpected event in 'wait_for_session': ~p",
+    ?ERROR_MSG("Unexpected event in 'wait_for_session': ~p",
 	       [_Event]),
     {next_state, wait_for_session, State}.
 
 wait_for_session(#body{attrs = Attrs} = Req, From,
 		 State) ->
     RID = get_attr(rid, Attrs),
-    ?DEBUG("got request:~n** RequestID: ~p~n** Request: "
+    ?DEBUG("Got request:~n** RequestID: ~p~n** Request: "
 	   "~p~n** From: ~p~n** State: ~p",
 	   [RID, Req, From, State]),
     Wait = min(get_attr(wait, Attrs, undefined),
@@ -352,13 +326,11 @@ wait_for_session(#body{attrs = Attrs} = Req, From,
     NewKey = get_attr(newkey, Attrs),
     Type = get_attr(type, Attrs),
     Requests = Hold + 1,
-    {PollTime, Polling} = if Wait == 0, Hold == 0 ->
-				 {p1_time_compat:timestamp(), [{polling, ?DEFAULT_POLLING}]};
-			     true -> {undefined, []}
-			  end,
-    MaxPause = gen_mod:get_module_opt(State#state.host,
-				      mod_bosh, max_pause,
-                                      ?DEFAULT_MAXPAUSE),
+    PollTime = if
+		   Wait == 0, Hold == 0 -> erlang:timestamp();
+		   true -> undefined
+	       end,
+    MaxPause = mod_bosh_opt:max_pause(State#state.host) div 1000,
     Resp = #body{attrs =
 		     [{sid, State#state.sid}, {wait, Wait},
 		      {ver, ?BOSH_VERSION}, {polling, ?DEFAULT_POLLING},
@@ -366,10 +338,9 @@ wait_for_session(#body{attrs = Attrs} = Req, From,
 		      {hold, Hold}, {'xmpp:restartlogic', true},
 		      {requests, Requests}, {secure, true},
 		      {maxpause, MaxPause}, {'xmlns:xmpp', ?NS_BOSH},
-		      {'xmlns:stream', ?NS_STREAM}, {from, State#state.host}
-		      | Polling]},
+		      {'xmlns:stream', ?NS_STREAM}, {from, State#state.host}]},
     {ShaperState, _} =
-	shaper:update(State#state.shaper_state, Req#body.size),
+	ejabberd_shaper:update(State#state.shaper_state, Req#body.size),
     State1 = State#state{wait_timeout = Wait,
 			 prev_rid = RID, prev_key = NewKey,
 			 prev_poll = PollTime, shaper_state = ShaperState,
@@ -379,35 +350,42 @@ wait_for_session(#body{attrs = Attrs} = Req, From,
     {State3, RespEls} = get_response_els(State2),
     State4 = stop_inactivity_timer(State3),
     case RespEls of
-      [] ->
-	  State5 = restart_wait_timer(State4),
-	  Receivers = gb_trees:insert(RID, {From, Resp},
-				      State5#state.receivers),
-	  {next_state, active,
-	   State5#state{receivers = Receivers}};
-      _ ->
-	  reply_next_state(State4, Resp#body{els = RespEls}, RID,
-			   From)
+	[{xmlstreamstart, _, _} = El1] ->
+	    OutBuf = buf_in([El1], State4#state.el_obuf),
+	    State5 = restart_wait_timer(State4),
+	    Receivers = gb_trees:insert(RID, {From, Resp},
+					State5#state.receivers),
+	    {next_state, active,
+	     State5#state{receivers = Receivers, el_obuf = OutBuf}};
+	[] ->
+	    State5 = restart_wait_timer(State4),
+	    Receivers = gb_trees:insert(RID, {From, Resp},
+					State5#state.receivers),
+	    {next_state, active,
+	     State5#state{receivers = Receivers}};
+	_ ->
+	    reply_next_state(State4, Resp#body{els = RespEls}, RID,
+			     From)
     end;
 wait_for_session(_Event, _From, State) ->
-    ?ERROR_MSG("unexpected sync event in 'wait_for_session': ~p",
+    ?ERROR_MSG("Unexpected sync event in 'wait_for_session': ~p",
 	       [_Event]),
     {reply, {error, badarg}, wait_for_session, State}.
 
 active({#body{} = Body, From}, State) ->
     active1(Body, From, State);
 active(_Event, State) ->
-    ?ERROR_MSG("unexpected event in 'active': ~p",
+    ?ERROR_MSG("Unexpected event in 'active': ~p",
 	       [_Event]),
     {next_state, active, State}.
 
 active(#body{attrs = Attrs, size = Size} = Req, From,
        State) ->
-    ?DEBUG("got request:~n** Request: ~p~n** From: "
+    ?DEBUG("Got request:~n** Request: ~p~n** From: "
 	   "~p~n** State: ~p",
 	   [Req, From, State]),
     {ShaperState, Pause} =
-	shaper:update(State#state.shaper_state, Size),
+	ejabberd_shaper:update(State#state.shaper_state, Size),
     State1 = State#state{shaper_state = ShaperState},
     if Pause > 0 ->
 	    TRef = start_shaper_timer(Pause),
@@ -418,7 +396,7 @@ active(#body{attrs = Attrs, size = Size} = Req, From,
 		    {next_state, active,
 		     State2#state{shaped_receivers = Q}}
 	    catch error:full ->
-		  cancel_timer(TRef),
+		  misc:cancel_timer(TRef),
 		  RID = get_attr(rid, Attrs),
 		  reply_stop(State1,
 			     #body{http_reason = <<"Too many requests">>,
@@ -431,7 +409,7 @@ active(#body{attrs = Attrs, size = Size} = Req, From,
        true -> active1(Req, From, State1)
     end;
 active(_Event, _From, State) ->
-    ?ERROR_MSG("unexpected sync event in 'active': ~p",
+    ?ERROR_MSG("Unexpected sync event in 'active': ~p",
 	       [_Event]),
     {reply, {error, badarg}, active, State}.
 
@@ -462,7 +440,7 @@ active1(#body{attrs = Attrs} = Req, From, State) ->
                     {next_state, active,
                      do_reply(State, From, PrevBody, RID)};
                 none ->
-                    State1 = drop_holding_receiver(State),
+                    State1 = drop_holding_receiver(State, RID),
                     State2 = stop_inactivity_timer(State1),
                     State3 = restart_wait_timer(State2),
                     Receivers = gb_trees:insert(RID, {From, Req},
@@ -501,7 +479,7 @@ active1(#body{attrs = Attrs} = Req, From, State) ->
 	   Pause = get_attr(pause, Attrs, undefined),
 	   NewPoll = case State#state.prev_poll of
 		       undefined -> undefined;
-		       _ -> p1_time_compat:timestamp()
+		       _ -> erlang:timestamp()
 		     end,
 	   State5 = State4#state{prev_poll = NewPoll,
 				 prev_key = NewKey},
@@ -532,17 +510,15 @@ active1(#body{attrs = Attrs} = Req, From, State) ->
 	   end
     end.
 
-handle_event({become_controller, C2SPid}, StateName,
+handle_event({activate, C2SPid}, StateName,
 	     State) ->
     State1 = route_els(State#state{c2s_pid = C2SPid}),
     {next_state, StateName, State1};
 handle_event({change_shaper, Shaper}, StateName,
 	     State) ->
-    NewShaperState = shaper:new(Shaper),
-    {next_state, StateName,
-     State#state{shaper_state = NewShaperState}};
+    {next_state, StateName, State#state{shaper_state = Shaper}};
 handle_event(_Event, StateName, State) ->
-    ?ERROR_MSG("unexpected event in '~s': ~p",
+    ?ERROR_MSG("Unexpected event in '~ts': ~p",
 	       [StateName, _Event]),
     {next_state, StateName, State}.
 
@@ -568,7 +544,7 @@ handle_sync_event({send_xml, El}, _From, StateName,
 	  State2 = case p1_queue:out(State1#state.shaped_receivers)
 		       of
 		     {{value, {TRef, From, Body}}, Q} ->
-			 cancel_timer(TRef),
+			 misc:cancel_timer(TRef),
 			 p1_fsm:send_event(self(), {Body, From}),
 			 State1#state{shaped_receivers = Q};
 		     _ -> State1
@@ -582,13 +558,14 @@ handle_sync_event(deactivate_socket, _From, StateName,
     {reply, ok, StateName,
      StateData#state{c2s_pid = undefined}};
 handle_sync_event(_Event, _From, StateName, State) ->
-    ?ERROR_MSG("unexpected sync event in '~s': ~p",
+    ?ERROR_MSG("Unexpected sync event in '~ts': ~p",
 	       [StateName, _Event]),
     {reply, {error, badarg}, StateName, State}.
 
 handle_info({timeout, TRef, wait_timeout}, StateName,
 	    #state{wait_timer = TRef} = State) ->
-    {next_state, StateName, drop_holding_receiver(State)};
+    State2 = State#state{wait_timer = undefined},
+    {next_state, StateName, drop_holding_receiver(State2)};
 handle_info({timeout, TRef, inactive}, _StateName,
 	    #state{inactivity_timer = TRef} = State) ->
     {stop, normal, State};
@@ -606,24 +583,11 @@ handle_info({timeout, TRef, shaper_timeout}, StateName,
 	  {stop, normal, State};
       _ -> {next_state, StateName, State}
     end;
-handle_info({migrate, Node}, StateName, State) ->
-    if Node /= node() ->
-	   NewState = bounce_receivers(State, migrated),
-	   {migrate, NewState,
-	    {Node, ?MODULE, start, [StateName, NewState]}, 0};
-       true -> {next_state, StateName, State}
-    end;
 handle_info(_Info, StateName, State) ->
-    ?ERROR_MSG("unexpected info:~n** Msg: ~p~n** StateName: ~p",
+    ?ERROR_MSG("Unexpected info:~n** Msg: ~p~n** StateName: ~p",
 	       [_Info, StateName]),
     {next_state, StateName, State}.
 
-terminate({migrated, ClonePid}, _StateName, State) ->
-    ?INFO_MSG("Migrating session \"~s\" (c2s_pid = "
-	      "~p) to ~p on node ~p",
-	      [State#state.sid, State#state.c2s_pid, ClonePid,
-	       node(ClonePid)]),
-    mod_bosh:close_session(State#state.sid);
 terminate(_Reason, _StateName, State) ->
     mod_bosh:close_session(State#state.sid),
     case State#state.c2s_pid of
@@ -698,19 +662,21 @@ reply_stop(State, Body, From, RID) ->
     {stop, normal, do_reply(State, From, Body, RID)}.
 
 drop_holding_receiver(State) ->
-    RID = State#state.prev_rid,
+    drop_holding_receiver(State, State#state.prev_rid).
+drop_holding_receiver(State, RID) ->
     case gb_trees:lookup(RID, State#state.receivers) of
-      {value, {From, Body}} ->
-	  State1 = restart_inactivity_timer(State),
-	  Receivers = gb_trees:delete_any(RID,
-					  State1#state.receivers),
-	  State2 = State1#state{receivers = Receivers},
-	  do_reply(State2, From, Body, RID);
-      none -> State
+	{value, {From, Body}} ->
+	    State1 = restart_inactivity_timer(State),
+	    Receivers = gb_trees:delete_any(RID,
+					    State1#state.receivers),
+	    State2 = State1#state{receivers = Receivers},
+	    do_reply(State2, From, Body, RID);
+	none ->
+	    restart_inactivity_timer(State)
     end.
 
 do_reply(State, From, Body, RID) ->
-    ?DEBUG("send reply:~n** RequestID: ~p~n** Reply: "
+    ?DEBUG("Send reply:~n** RequestID: ~p~n** Reply: "
 	   "~p~n** To: ~p~n** State: ~p",
 	   [RID, Body, From, State]),
     p1_fsm:reply(From, Body),
@@ -724,7 +690,7 @@ do_reply(State, From, Body, RID) ->
     Responses2 = gb_trees:insert(RID, Body, Responses1),
     State#state{responses = Responses2}.
 
-bounce_receivers(State, Reason) ->
+bounce_receivers(State, _Reason) ->
     Receivers = gb_trees:to_list(State#state.receivers),
     ShapedReceivers = lists:map(fun ({_, From,
 				      #body{attrs = Attrs} = Body}) ->
@@ -732,26 +698,22 @@ bounce_receivers(State, Reason) ->
 					{RID, {From, Body}}
 				end,
 				p1_queue:to_list(State#state.shaped_receivers)),
-    lists:foldl(fun ({RID, {From, Body}}, AccState) ->
-			NewBody = if Reason == closed ->
-					 #body{http_reason =
-						   <<"Session closed">>,
-					       attrs =
-						   [{type, <<"terminate">>},
-						    {condition,
-						     <<"other-request">>}]};
-				     Reason == migrated ->
-					 Body#body{http_reason =
-						       <<"Session migrated">>}
-				  end,
+    lists:foldl(fun ({RID, {From, _Body}}, AccState) ->
+			NewBody = #body{http_reason =
+					    <<"Session closed">>,
+					attrs =
+					    [{type, <<"terminate">>},
+					     {condition,
+					      <<"other-request">>}]},
 			do_reply(AccState, From, NewBody, RID)
 		end,
 		State, Receivers ++ ShapedReceivers).
 
 bounce_els_from_obuf(State) ->
+    Opts = ejabberd_config:codec_options(),
     p1_queue:foreach(
       fun({xmlstreamelement, El}) ->
-	      try xmpp:decode(El, ?NS_CLIENT, [ignore_els]) of
+	      try xmpp:decode(El, ?NS_CLIENT, Opts) of
 		  Pkt when ?is_stanza(Pkt) ->
 		      case {xmpp:get_from(Pkt), xmpp:get_to(Pkt)} of
 			  {#jid{}, #jid{}} ->
@@ -774,7 +736,7 @@ is_valid_key(PrevKey, Key) ->
 
 is_overactivity(undefined) -> false;
 is_overactivity(PrevPoll) ->
-    PollPeriod = timer:now_diff(p1_time_compat:timestamp(), PrevPoll) div
+    PollPeriod = timer:now_diff(erlang:timestamp(), PrevPoll) div
 		   1000000,
     if PollPeriod < (?DEFAULT_POLLING) -> true;
        true -> false
@@ -926,7 +888,9 @@ decode_body(Data, Size, Type) ->
     end.
 
 decode(Data, xml) ->
-    fxml_stream:parse_element(Data).
+    fxml_stream:parse_element(Data);
+decode(Data, json) ->
+    Data.
 
 attrs_to_body_attrs(Attrs) ->
     lists:foldl(fun (_, {error, Reason}) -> {error, Reason};
@@ -985,7 +949,7 @@ bosh_response(Body, Type) ->
      encode_body(Body, Type)}.
 
 bosh_response_with_msg(Body, Type, RcvBody) ->
-    ?DEBUG("send error reply:~p~n** Receiced body: ~p",
+    ?DEBUG("Send error reply:~p~n** Receiced body: ~p",
 	   [Body, RcvBody]),
     bosh_response(Body, Type).
 
@@ -996,7 +960,7 @@ http_error(Status, Reason, Type) ->
             end,
     {Status, Reason, ?HEADER(CType), <<"">>}.
 
-make_sid() -> str:sha(randoms:get_string()).
+make_sid() -> str:sha(p1_rand:get_string()).
 
 -compile({no_auto_import, [{min, 2}]}).
 
@@ -1030,9 +994,7 @@ buf_new(Host) ->
     buf_new(Host, unlimited).
 
 buf_new(Host, Limit) ->
-    QueueType = gen_mod:get_module_opt(
-		  Host, mod_bosh, queue_type,
-		  ejabberd_config:default_queue_type(Host)),
+    QueueType = mod_bosh_opt:queue_type(Host),
     p1_queue:new(QueueType, Limit).
 
 buf_in(Xs, Buf) ->
@@ -1050,12 +1012,8 @@ buf_out(Buf, I, Els) ->
       {empty, _} -> buf_out(Buf, 0, Els)
     end.
 
-cancel_timer(TRef) when is_reference(TRef) ->
-    p1_fsm:cancel_timer(TRef);
-cancel_timer(_) -> false.
-
 restart_timer(TRef, Timeout, Msg) ->
-    cancel_timer(TRef),
+    misc:cancel_timer(TRef),
     erlang:start_timer(timer:seconds(Timeout), self(), Msg).
 
 restart_inactivity_timer(#state{inactivity_timeout =
@@ -1072,7 +1030,7 @@ restart_inactivity_timer(#state{inactivity_timer =
 
 stop_inactivity_timer(#state{inactivity_timer = TRef} =
 			  State) ->
-    cancel_timer(TRef),
+    misc:cancel_timer(TRef),
     State#state{inactivity_timer = undefined}.
 
 restart_wait_timer(#state{wait_timer = TRef,
@@ -1082,13 +1040,13 @@ restart_wait_timer(#state{wait_timer = TRef,
     State#state{wait_timer = NewTRef}.
 
 stop_wait_timer(#state{wait_timer = TRef} = State) ->
-    cancel_timer(TRef), State#state{wait_timer = undefined}.
+    misc:cancel_timer(TRef), State#state{wait_timer = undefined}.
 
 start_shaper_timer(Timeout) ->
     erlang:start_timer(Timeout, self(), shaper_timeout).
 
 make_random_jid(Host) ->
-    User = randoms:get_string(),
-    jid:make(User, Host, randoms:get_string()).
+    User = p1_rand:get_string(),
+    jid:make(User, Host, p1_rand:get_string()).
 
 make_socket(Pid, IP) -> {http_bind, Pid, IP}.

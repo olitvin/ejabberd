@@ -4,7 +4,7 @@
 %%% Created :  8 May 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -33,10 +33,10 @@
 %% API
 -export([start_link/1, get_proc/1, get_connection/1, q/1, qp/1, format_error/1]).
 %% Commands
--export([multi/1, get/1, set/2, del/1,
+-export([multi/1, get/1, set/2, del/1, info/1,
 	 sadd/2, srem/2, smembers/1, sismember/2, scard/1,
 	 hget/2, hset/3, hdel/2, hlen/1, hgetall/1, hkeys/1,
-	 subscribe/1, publish/2]).
+	 subscribe/1, publish/2, script_load/1, evalsha/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -45,23 +45,28 @@
 -define(SERVER, ?MODULE).
 -define(PROCNAME, 'ejabberd_redis_client').
 -define(TR_STACK, redis_transaction_stack).
--define(DEFAULT_MAX_QUEUE, 5000).
+-define(DEFAULT_MAX_QUEUE, 10000).
 -define(MAX_RETRIES, 1).
 -define(CALL_TIMEOUT, 60*1000). %% 60 seconds
 
 -include("logger.hrl").
--include("ejabberd.hrl").
+-include("ejabberd_stacktrace.hrl").
 
 -record(state, {connection :: pid() | undefined,
 		num :: pos_integer(),
-		subscriptions = #{} :: map(),
-		pending_q :: p1_queue:queue()}).
+		subscriptions = #{} :: subscriptions(),
+		pending_q :: queue()}).
 
+-type queue() :: p1_queue:queue({{pid(), term()}, integer()}).
+-type subscriptions() :: #{binary() => [pid()]}.
 -type error_reason() :: binary() | timeout | disconnected | overloaded.
 -type redis_error() :: {error, error_reason()}.
--type redis_reply() :: binary() | [binary()].
--type redis_command() :: [binary()].
+-type redis_reply() :: undefined | binary() | [binary()].
+-type redis_command() :: [iodata() | integer()].
 -type redis_pipeline() :: [redis_command()].
+-type redis_info() :: server | clients | memory | persistence |
+		      stats | replication | cpu | commandstats |
+		      cluster | keyspace | default | all.
 -type state() :: #state{}.
 
 -export_type([error_reason/0]).
@@ -86,27 +91,26 @@ get_connection(I) ->
 q(Command) ->
     call(get_rnd_id(), {q, Command}, ?MAX_RETRIES).
 
--spec qp(redis_pipeline()) -> {ok, [redis_reply()]} | redis_error().
+-spec qp(redis_pipeline()) -> [{ok, redis_reply()} | redis_error()] | redis_error().
 qp(Pipeline) ->
     call(get_rnd_id(), {qp, Pipeline}, ?MAX_RETRIES).
 
--spec multi(fun(() -> any())) -> {ok, [redis_reply()]} | redis_error().
+-spec multi(fun(() -> any())) -> {ok, redis_reply()} | redis_error().
 multi(F) ->
     case erlang:get(?TR_STACK) of
 	undefined ->
 	    erlang:put(?TR_STACK, []),
 	    try F() of
 		_ ->
-		    Stack = erlang:get(?TR_STACK),
-		    erlang:erase(?TR_STACK),
+		    Stack = erlang:erase(?TR_STACK),
 		    Command = [["MULTI"]|lists:reverse([["EXEC"]|Stack])],
 		    case qp(Command) of
 			{error, _} = Err -> Err;
 			Result -> get_result(Result)
 		    end
-	    catch E:R ->
+	    catch ?EX_RULE(E, R, St) ->
 		    erlang:erase(?TR_STACK),
-		    erlang:raise(E, R, erlang:get_stacktrace())
+		    erlang:raise(E, R, ?EX_STACK(St))
 	    end;
 	_ ->
 	    erlang:error(nested_transaction)
@@ -295,7 +299,7 @@ hkeys(Key) ->
 
 -spec subscribe([binary()]) -> ok | redis_error().
 subscribe(Channels) ->
-    try ?GEN_SERVER:call(get_proc(1), {subscribe, self(), Channels}, ?CALL_TIMEOUT)
+    try gen_server_call(get_proc(1), {subscribe, self(), Channels})
     catch exit:{Why, {?GEN_SERVER, call, _}} ->
 	    Reason = case Why of
 			 timeout -> timeout;
@@ -317,6 +321,40 @@ publish(Channel, Data) ->
 	    tr_enq(Cmd, Stack)
     end.
 
+-spec script_load(iodata()) -> {ok, binary()} | redis_error().
+script_load(Data) ->
+    case erlang:get(?TR_STACK) of
+	undefined ->
+	    q([<<"SCRIPT">>, <<"LOAD">>, Data]);
+	_ ->
+	    erlang:error(transaction_unsupported)
+    end.
+
+-spec evalsha(binary(), [iodata()], [iodata() | integer()]) -> {ok, binary()} | redis_error().
+evalsha(SHA, Keys, Args) ->
+    case erlang:get(?TR_STACK) of
+	undefined ->
+	    q([<<"EVALSHA">>, SHA, length(Keys)|Keys ++ Args]);
+	_ ->
+	    erlang:error(transaction_unsupported)
+    end.
+
+-spec info(redis_info()) -> {ok, [{atom(), binary()}]} | redis_error().
+info(Type) ->
+    case erlang:get(?TR_STACK) of
+	undefined ->
+	    case q([<<"INFO">>, misc:atom_to_binary(Type)]) of
+		{ok, Info} ->
+		    Lines = binary:split(Info, <<"\r\n">>, [global]),
+		    KVs = [binary:split(Line, <<":">>) || Line <- Lines],
+		    {ok, [{misc:binary_to_atom(K), V} || [K, V] <- KVs]};
+		{error, _} = Err ->
+		    Err
+	    end;
+	_ ->
+	    erlang:error(transaction_unsupported)
+    end.
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -329,7 +367,7 @@ init([I]) ->
 
 handle_call(connect, From, #state{connection = undefined,
 				  pending_q = Q} = State) ->
-    CurrTime = p1_time_compat:monotonic_time(milli_seconds),
+    CurrTime = erlang:monotonic_time(millisecond),
     Q2 = try p1_queue:in({From, CurrTime}, Q)
 	 catch error:full ->
 		 Q1 = clean_queue(Q, CurrTime),
@@ -354,7 +392,7 @@ handle_call({subscribe, Caller, Channels}, _From,
     eredis_subscribe(Pid, Channels),
     {reply, ok, State#state{subscriptions = Subs1}};
 handle_call(Request, _From, State) ->
-    ?WARNING_MSG("unexepected call: ~p", [Request]),
+    ?WARNING_MSG("Unexpected call: ~p", [Request]),
     {noreply, State}.
 
 handle_cast(_Msg, State) ->
@@ -387,7 +425,7 @@ handle_info({subscribed, Channel, Pid}, State) ->
 	    case maps:is_key(Channel, State#state.subscriptions) of
 		true -> eredis_sub:ack_message(Pid);
 		false ->
-		    ?WARNING_MSG("got subscription ack for unknown channel ~s",
+		    ?WARNING_MSG("Got subscription ack for unknown channel ~ts",
 				 [Channel])
 	    end;
 	_ ->
@@ -407,7 +445,7 @@ handle_info({message, Channel, Data, Pid}, State) ->
     end,
     {noreply, State};
 handle_info(Info, State) ->
-    ?WARNING_MSG("unexpected info = ~p", [Info]),
+    ?WARNING_MSG("Unexpected info = ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -421,16 +459,14 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 -spec connect(state()) -> {ok, pid()} | {error, any()}.
 connect(#state{num = Num}) ->
-    Server = ejabberd_config:get_option(redis_server, "localhost"),
-    Port = ejabberd_config:get_option(redis_port, 6379),
-    DB = ejabberd_config:get_option(redis_db, 0),
-    Pass = ejabberd_config:get_option(redis_password, ""),
-    ConnTimeout = timer:seconds(
-		    ejabberd_config:get_option(
-		      redis_connect_timeout, 1)),
+    Server = ejabberd_option:redis_server(),
+    Port = ejabberd_option:redis_port(),
+    DB = ejabberd_option:redis_db(),
+    Pass = ejabberd_option:redis_password(),
+    ConnTimeout = ejabberd_option:redis_connect_timeout(),
     try case do_connect(Num, Server, Port, Pass, DB, ConnTimeout) of
 	    {ok, Client} ->
-		?DEBUG("Connection #~p established to Redis at ~s:~p",
+		?DEBUG("Connection #~p established to Redis at ~ts:~p",
 		       [Num, Server, Port]),
 		register(get_connection(Num), Client),
 		{ok, Client};
@@ -438,9 +474,9 @@ connect(#state{num = Num}) ->
 		erlang:error(Why)
 	end
     catch _:Reason ->
-	    Timeout = randoms:uniform(
+	    Timeout = p1_rand:uniform(
 			min(10, ejabberd_redis_sup:get_pool_size())),
-	    ?ERROR_MSG("Redis connection #~p at ~s:~p has failed: ~p; "
+	    ?ERROR_MSG("Redis connection #~p at ~ts:~p has failed: ~p; "
 		       "reconnecting in ~p seconds",
 		       [Num, Server, Port, Reason, Timeout]),
 	    erlang:send_after(timer:seconds(Timeout), self(), connect),
@@ -461,9 +497,9 @@ do_connect(_, Server, Port, Pass, DB, ConnTimeout) ->
 -spec call(pos_integer(), {q, redis_command()}, integer()) ->
 		  {ok, redis_reply()} | redis_error();
 	  (pos_integer(), {qp, redis_pipeline()}, integer()) ->
-		  {ok, [redis_reply()]} | redis_error().
+		  [{ok, redis_reply()} | redis_error()] | redis_error().
 call(I, {F, Cmd}, Retries) ->
-    ?DEBUG("redis query: ~p", [Cmd]),
+    ?DEBUG("Redis query: ~p", [Cmd]),
     Conn = get_connection(I),
     Res = try eredis:F(Conn, Cmd, ?CALL_TIMEOUT) of
 	      {error, Reason} when is_atom(Reason) ->
@@ -476,7 +512,7 @@ call(I, {F, Cmd}, Retries) ->
 	  end,
     case Res of
 	{error, disconnected} when Retries > 0 ->
-	    try ?GEN_SERVER:call(get_proc(I), connect, ?CALL_TIMEOUT) of
+	    try gen_server_call(get_proc(I), connect) of
 		ok -> call(I, {F, Cmd}, Retries-1);
 		{error, _} = Err -> Err
 	    catch exit:{Why, {?GEN_SERVER, call, _}} ->
@@ -494,19 +530,27 @@ call(I, {F, Cmd}, Retries) ->
 	    Res
     end.
 
+gen_server_call(Proc, Msg) ->
+    case ejabberd_redis_sup:start() of
+	ok ->
+	    ?GEN_SERVER:call(Proc, Msg, ?CALL_TIMEOUT);
+	{error, _} ->
+	    {error, disconnected}
+    end.
+
 -spec log_error(redis_command() | redis_pipeline(), atom() | binary()) -> ok.
 log_error(Cmd, Reason) ->
     ?ERROR_MSG("Redis request has failed:~n"
 	       "** request = ~p~n"
-	       "** response = ~s",
+	       "** response = ~ts",
 	       [Cmd, format_error(Reason)]).
 
 -spec get_rnd_id() -> pos_integer().
 get_rnd_id() ->
-    randoms:round_robin(ejabberd_redis_sup:get_pool_size() - 1) + 2.
+    p1_rand:round_robin(ejabberd_redis_sup:get_pool_size() - 1) + 2.
 
--spec get_result([{error, atom() | binary()} | {ok, iodata()}]) ->
-			{ok, [redis_reply()]} | {error, binary()}.
+-spec get_result([{ok, redis_reply()} | redis_error()]) ->
+			{ok, redis_reply()} | redis_error().
 get_result([{error, _} = Err|_]) ->
     Err;
 get_result([{ok, _} = OK]) ->
@@ -547,13 +591,11 @@ fsm_limit_opts() ->
     ejabberd_config:fsm_limit_opts([]).
 
 get_queue_type() ->
-    ejabberd_config:get_option(
-      redis_queue_type,
-      ejabberd_config:default_queue_type(global)).
+    ejabberd_option:redis_queue_type().
 
--spec flush_queue(p1_queue:queue()) -> p1_queue:queue().
+-spec flush_queue(queue()) -> queue().
 flush_queue(Q) ->
-    CurrTime = p1_time_compat:monotonic_time(milli_seconds),
+    CurrTime = erlang:monotonic_time(millisecond),
     p1_queue:dropwhile(
       fun({From, Time}) ->
 	      if (CurrTime - Time) >= ?CALL_TIMEOUT ->
@@ -564,7 +606,7 @@ flush_queue(Q) ->
 	      true
       end, Q).
 
--spec clean_queue(p1_queue:queue(), integer()) -> p1_queue:queue().
+-spec clean_queue(queue(), integer()) -> queue().
 clean_queue(Q, CurrTime) ->
     Q1 = p1_queue:dropwhile(
 	   fun({_From, Time}) ->
@@ -590,5 +632,5 @@ re_subscribe(Pid, Subs) ->
     end.
 
 eredis_subscribe(Pid, Channels) ->
-    ?DEBUG("redis query: ~p", [[<<"SUBSCRIBE">>|Channels]]),
+    ?DEBUG("Redis query: ~p", [[<<"SUBSCRIBE">>|Channels]]),
     eredis_sub:subscribe(Pid, Channels).

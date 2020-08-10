@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,7 +30,7 @@
 %%% <p>PubSub node tree plugins are using the {@link gen_nodetree} behaviour.</p>
 %%% <p><strong>The API isn't stabilized yet</strong>. The pubsub plugin
 %%% development is still a work in progress. However, the system is already
-%%% useable and useful as is. Please, send us comments, feedback and
+%%% usable and useful as is. Please, send us comments, feedback and
 %%% improvements.</p>
 
 -module(nodetree_tree).
@@ -38,9 +38,11 @@
 -author('christophe.romain@process-one.net').
 
 -include_lib("stdlib/include/qlc.hrl").
+-include_lib("stdlib/include/ms_transform.hrl").
 
 -include("pubsub.hrl").
 -include("xmpp.hrl").
+-include("translate.hrl").
 
 -export([init/3, terminate/2, options/0, set_node/1,
     get_node/3, get_node/2, get_node/1, get_nodes/2,
@@ -71,51 +73,87 @@ get_node(Host, Node, _From) ->
 get_node(Host, Node) ->
     case mnesia:read({pubsub_node, {Host, Node}}) of
 	[Record] when is_record(Record, pubsub_node) -> Record;
-	_ -> {error, xmpp:err_item_not_found(<<"Node not found">>, ?MYLANG)}
+	_ -> {error, xmpp:err_item_not_found(?T("Node not found"), ejabberd_option:language())}
     end.
 
 get_node(Nidx) ->
     case mnesia:index_read(pubsub_node, Nidx, #pubsub_node.id) of
 	[Record] when is_record(Record, pubsub_node) -> Record;
-	_ -> {error, xmpp:err_item_not_found(<<"Node not found">>, ?MYLANG)}
+	_ -> {error, xmpp:err_item_not_found(?T("Node not found"), ejabberd_option:language())}
     end.
-
-get_nodes(Host, _From) ->
-    get_nodes(Host).
 
 get_nodes(Host) ->
-    mnesia:match_object(#pubsub_node{nodeid = {Host, '_'}, _ = '_'}).
+    get_nodes(Host, infinity).
 
-get_parentnodes(_Host, _Node, _From) ->
-    [].
-
-%% @doc <p>Default node tree does not handle parents, return a list
-%% containing just this node.</p>
-get_parentnodes_tree(Host, Node, _From) ->
-    case catch mnesia:read({pubsub_node, {Host, Node}}) of
-	[Record] when is_record(Record, pubsub_node) -> [{0, [Record]}];
-	_ -> []
+get_nodes(Host, infinity) ->
+    mnesia:match_object(#pubsub_node{nodeid = {Host, '_'}, _ = '_'});
+get_nodes(Host, Limit) ->
+    case mnesia:select(
+	   pubsub_node,
+	   ets:fun2ms(
+	     fun(#pubsub_node{nodeid = {H, _}} = Node) when H == Host ->
+		     Node
+	     end), Limit, read) of
+	'$end_of_table' -> [];
+	{Nodes, _} -> Nodes
     end.
 
-get_subnodes(Host, Node, _From) ->
-    get_subnodes(Host, Node).
+get_parentnodes(Host, Node, _From) ->
+    case catch mnesia:read({pubsub_node, {Host, Node}}) of
+	[Record] when is_record(Record, pubsub_node) ->
+	    Record#pubsub_node.parents;
+	_ ->
+	    []
+    end.
 
-get_subnodes(Host, <<>>) ->
-    Q = qlc:q([N
-		|| #pubsub_node{nodeid = {NHost, _},
-			parents = Parents} =
-		    N
-		    <- mnesia:table(pubsub_node),
-		    Host == NHost, Parents == []]),
-    qlc:e(Q);
-get_subnodes(Host, Node) ->
+get_parentnodes_tree(Host, Node, _From) ->
+    get_parentnodes_tree(Host, Node, 0, []).
+get_parentnodes_tree(Host, Node, Level, Acc) ->
+    case catch mnesia:read({pubsub_node, {Host, Node}}) of
+	[Record] when is_record(Record, pubsub_node) ->
+	    Tree = [{Level, [Record]}|Acc],
+	    case Record#pubsub_node.parents of
+		[Parent] -> get_parentnodes_tree(Host, Parent, Level+1, Tree);
+		_ -> Tree
+	    end;
+	_ ->
+	    Acc
+    end.
+
+get_subnodes(Host, <<>>, infinity) ->
+    mnesia:match_object(#pubsub_node{nodeid = {Host, '_'}, parents = [], _ = '_'});
+get_subnodes(Host, <<>>, Limit) ->
+    case mnesia:select(
+	   pubsub_node,
+	   ets:fun2ms(
+	     fun(#pubsub_node{nodeid = {H, _}, parents = []} = Node) when H == Host ->
+		     Node
+	     end), Limit, read) of
+	'$end_of_table' -> [];
+	{Nodes, _} -> Nodes
+    end;
+get_subnodes(Host, Node, infinity) ->
     Q = qlc:q([N
 		|| #pubsub_node{nodeid = {NHost, _},
 			parents = Parents} =
 		    N
 		    <- mnesia:table(pubsub_node),
 		    Host == NHost, lists:member(Node, Parents)]),
-    qlc:e(Q).
+    qlc:e(Q);
+get_subnodes(Host, Node, Limit) ->
+    case mnesia:select(
+	   pubsub_node,
+	   ets:fun2ms(
+	     fun(#pubsub_node{nodeid = {H, _}, parents = Ps} = N)
+		   when H == Host andalso Ps /= [] -> N
+	     end), Limit, read) of
+	'$end_of_table' -> [];
+	{Nodes, _} ->
+	    lists:filter(
+	      fun(#pubsub_node{parents = Parents}) ->
+		      lists:member(Node, Parents)
+	      end, Nodes)
+    end.
 
 get_subnodes_tree(Host, Node, _From) ->
     get_subnodes_tree(Host, Node).
@@ -127,11 +165,11 @@ get_subnodes_tree(Host, Node) ->
 	Rec ->
 	    BasePlugin = misc:binary_to_atom(<<"node_",
 			(Rec#pubsub_node.type)/binary>>),
-	    BasePath = BasePlugin:node_to_path(Node),
+	    {result, BasePath} = BasePlugin:node_to_path(Node),
 	    mnesia:foldl(fun (#pubsub_node{nodeid = {H, N}} = R, Acc) ->
 			Plugin = misc:binary_to_atom(<<"node_",
 				    (R#pubsub_node.type)/binary>>),
-			Path = Plugin:node_to_path(N),
+			{result, Path} = Plugin:node_to_path(N),
 			case lists:prefix(BasePath, Path) and (H == Host) of
 			    true -> [R | Acc];
 			    false -> Acc
@@ -178,7 +216,7 @@ create_node(Host, Node, Type, Owner, Options, Parents) ->
 		    {error, xmpp:err_forbidden()}
 	    end;
 	_ ->
-	    {error, xmpp:err_conflict(<<"Node already exists">>, ?MYLANG)}
+	    {error, xmpp:err_conflict(?T("Node already exists"), ejabberd_option:language())}
     end.
 
 delete_node(Host, Node) ->

@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,8 +30,9 @@
 -behaviour(gen_pubsub_node).
 -author('christophe.romain@process-one.net').
 
+
 -include("pubsub.hrl").
--include("logger.hrl").
+-include("ejabberd_sql_pt.hrl").
 
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
@@ -45,7 +46,8 @@
     set_state/1, get_items/7, get_items/3, get_item/7,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1, depends/3,
-    get_entity_subscriptions_for_send_last/2, get_last_items/3]).
+    get_entity_subscriptions_for_send_last/2, get_last_items/3,
+    get_only_item/2]).
 
 depends(_Host, _ServerHost, _Opts) ->
     [{mod_caps, hard}].
@@ -72,8 +74,7 @@ create_node(Nidx, Owner) ->
     {result, {default, broadcast}}.
 
 delete_node(Nodes) ->
-    {result, {_, _, Result}} = node_flat_sql:delete_node(Nodes),
-    {result, {default, Result}}.
+    node_flat_sql:delete_node(Nodes).
 
 subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 	    SendLast, PresenceSubscription, RosterGroup, Options) ->
@@ -116,78 +117,76 @@ set_affiliation(Nidx, Owner, Affiliation) ->
 get_entity_subscriptions(_Host, Owner) ->
     SubKey = jid:tolower(Owner),
     GenKey = jid:remove_resource(SubKey),
-    HostLike = node_flat_sql:encode_host_like(element(2, SubKey)),
-    SJ = ejabberd_sql:escape(node_flat_sql:encode_jid(SubKey)),
-    GJ = ejabberd_sql:escape(node_flat_sql:encode_jid(GenKey)),
-    GJLike = ejabberd_sql:escape(node_flat_sql:encode_jid_like(GenKey)),
+    HLike = <<"%@", (node_flat_sql:encode_host_like(element(2, SubKey)))/binary>>,
+    GJ = node_flat_sql:encode_jid(GenKey),
     Query = case SubKey of
-	GenKey ->
-	    [<<"select host, node, type, i.nodeid, jid, "
-		    "subscriptions from pubsub_state i, pubsub_node n "
-		    "where i.nodeid = n.nodeid and jid "
-		    "like '">>, GJLike, <<"%' escape '^' and host like '%@">>, HostLike, <<"' escape '^';">>];
-	_ ->
-	    [<<"select host, node, type, i.nodeid, jid, "
-		    "subscriptions from pubsub_state i, pubsub_node n "
-		    "where i.nodeid = n.nodeid and jid "
-		    "in ('">>, SJ, <<"', '">>, GJ, <<"') and host like '%@">>, HostLike, <<"' escape '^';">>]
-    end,
-    Reply = case catch ejabberd_sql:sql_query_t(Query) of
-	{selected,
-		    [<<"host">>, <<"node">>, <<"type">>, <<"nodeid">>, <<"jid">>, <<"subscriptions">>],
-		    RItems} ->
-	    lists:map(fun ([H, N, T, I, J, S]) ->
-			O = node_flat_sql:decode_jid(H),
-			Node = nodetree_tree_sql:raw_to_node(O, [N, <<"">>, T, I]),
-			{Node,
-			    node_flat_sql:decode_subscriptions(S),
-			    node_flat_sql:decode_jid(J)}
-		end,
-		RItems);
-	_ ->
-	    []
-    end,
-    {result, Reply}.
+	      GenKey ->
+		GJLike = <<(node_flat_sql:encode_jid_like(GenKey))/binary, "/%">>,
+		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
+		     "from pubsub_state i, pubsub_node n "
+		     "where i.nodeid = n.nodeid and "
+		     "(jid=%(GJ)s or jid like %(GJLike)s %ESCAPE) and host like %(HLike)s %ESCAPE");
+	      _ ->
+		SJ = node_flat_sql:encode_jid(SubKey),
+		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
+		     "from pubsub_state i, pubsub_node n "
+		     "where i.nodeid = n.nodeid and "
+		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s %ESCAPE")
+	    end,
+    {result,
+     case ejabberd_sql:sql_query_t(Query) of
+	 {selected, RItems} ->
+	     lists:foldl(
+	       fun({H, N, T, I, J, S}, Acc) ->
+		       O = node_flat_sql:decode_jid(H),
+		       Node = nodetree_tree_sql:raw_to_node(O, {N, <<"">>, T, I}),
+		       Jid = node_flat_sql:decode_jid(J),
+		       lists:foldl(
+			 fun({Sub, SubId}, Acc2) ->
+			     [{Node, Sub, SubId, Jid} | Acc2]
+			 end, Acc, node_flat_sql:decode_subscriptions(S))
+	       end, [], RItems);
+	 _ ->
+	     []
+     end}.
 
 get_entity_subscriptions_for_send_last(_Host, Owner) ->
     SubKey = jid:tolower(Owner),
     GenKey = jid:remove_resource(SubKey),
-    HostLike = node_flat_sql:encode_host_like(element(2, SubKey)),
-    SJ = ejabberd_sql:escape(node_flat_sql:encode_jid(SubKey)),
-    GJ = ejabberd_sql:escape(node_flat_sql:encode_jid(GenKey)),
-    GJLike = ejabberd_sql:escape(node_flat_sql:encode_jid_like(GenKey)),
+    HLike = <<"%@", (node_flat_sql:encode_host_like(element(2, SubKey)))/binary>>,
+    GJ = node_flat_sql:encode_jid(GenKey),
     Query = case SubKey of
-	GenKey ->
-	    [<<"select host, node, type, i.nodeid, jid, "
-		    "subscriptions from pubsub_state i, pubsub_node n, "
-		    "pubsub_node_option o where i.nodeid = n.nodeid "
-		    "and n.nodeid = o.nodeid and name='send_last_published_item' and "
-		    "val='on_sub_and_presence' and jid like '">>,
-		GJLike, <<"%' escape '^' and host like '%@">>, HostLike, <<"' escape '^';">>];
-	_ ->
-	    [<<"select host, node, type, i.nodeid, jid, "
-		    "subscriptions from pubsub_state i, pubsub_node n, "
-		    "pubsub_node_option o where i.nodeid = n.nodeid "
-		    "and n.nodeid = o.nodeid and name='send_last_published_item' and "
-		    "val='on_sub_and_presence' and jid in ",
-		    "('">>, SJ, <<"', '">>, GJ, <<"') and host like '%@">>, HostLike, <<"' escape '^';">>]
-    end,
-    Reply = case catch ejabberd_sql:sql_query_t(Query) of
-	{selected,
-		    [<<"host">>, <<"node">>, <<"type">>, <<"nodeid">>, <<"jid">>, <<"subscriptions">>],
-		    RItems} ->
-	    lists:map(fun ([H, N, T, I, J, S]) ->
-			O = node_flat_sql:decode_jid(H),
-			Node = nodetree_tree_sql:raw_to_node(O, [N, <<"">>, T, I]),
-			{Node,
-			    node_flat_sql:decode_subscriptions(S),
-			    node_flat_sql:decode_jid(J)}
-		end,
-		RItems);
-	_ ->
-	    []
-    end,
-    {result, Reply}.
+	      GenKey ->
+		GJLike = <<(node_flat_sql:encode_jid_like(GenKey))/binary, "/%">>,
+		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
+		     "from pubsub_state i, pubsub_node n, pubsub_node_option o "
+		     "where i.nodeid = n.nodeid and n.nodeid = o.nodeid and "
+		     "name='send_last_published_item' and val='on_sub_and_presence' and "
+		     "(jid=%(GJ)s or jid like %(GJLike)s %ESCAPE) and host like %(HLike)s %ESCAPE");
+	      _ ->
+		SJ = node_flat_sql:encode_jid(SubKey),
+		?SQL("select @(host)s, @(node)s, @(plugin)s, @(i.nodeid)d, @(jid)s, @(subscriptions)s "
+		     "from pubsub_state i, pubsub_node n, pubsub_node_option o "
+		     "where i.nodeid = n.nodeid and n.nodeid = o.nodeid and "
+		     "name='send_last_published_item' and val='on_sub_and_presence' and "
+		     "jid in (%(SJ)s,%(GJ)s) and host like %(HLike)s %ESCAPE")
+	    end,
+    {result,
+     case ejabberd_sql:sql_query_t(Query) of
+	 {selected, RItems} ->
+	     lists:foldl(
+	       fun ({H, N, T, I, J, S}, Acc) ->
+		       O = node_flat_sql:decode_jid(H),
+		       Node = nodetree_tree_sql:raw_to_node(O, {N, <<"">>, T, I}),
+		       Jid = node_flat_sql:decode_jid(J),
+		       lists:foldl(
+			 fun ({Sub, SubId}, Acc2) ->
+			     [{Node, Sub, SubId, Jid}| Acc2]
+			 end, Acc, node_flat_sql:decode_subscriptions(S))
+	       end, [], RItems);
+	 _ ->
+	     []
+     end}.
 
 get_node_subscriptions(Nidx) ->
     node_flat_sql:get_node_subscriptions(Nidx).
@@ -219,6 +218,9 @@ get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM)
 
 get_last_items(Nidx, JID, Count) ->
     node_flat_sql:get_last_items(Nidx, JID, Count).
+
+get_only_item(Nidx, JID) ->
+    node_flat_sql:get_only_item(Nidx, JID).
 
 get_item(Nidx, ItemId) ->
     node_flat_sql:get_item(Nidx, ItemId).

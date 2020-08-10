@@ -5,7 +5,7 @@
 %%% Created :  1 Dec 2007 by Christophe Romain <christophe.romain@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -31,7 +31,6 @@
 -author('christophe.romain@process-one.net').
 
 -include("pubsub.hrl").
--include("logger.hrl").
 
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,
@@ -43,7 +42,7 @@
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
-    get_last_items/3,
+    get_last_items/3, get_only_item/2,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1, depends/3]).
 
@@ -88,6 +87,7 @@ features() ->
 	<<"outcast-affiliation">>,
 	<<"persistent-items">>,
 	<<"publish">>,
+	<<"publish-options">>,
 	<<"purge-nodes">>,
 	<<"retract-items">>,
 	<<"retrieve-affiliations">>,
@@ -118,8 +118,7 @@ create_node(Nidx, Owner) ->
     node_flat:create_node(Nidx, Owner).
 
 delete_node(Nodes) ->
-    {result, {_, _, Result}} = node_flat:delete_node(Nodes),
-    {result, {default, Result}}.
+    node_flat:delete_node(Nodes).
 
 subscribe_node(Nidx, Sender, Subscriber, AccessModel,
 	    SendLast, PresenceSubscription, RosterGroup, Options) ->
@@ -231,6 +230,9 @@ get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM)
 
 get_last_items(Nidx, From, Count) ->
     node_flat:get_last_items(Nidx, From, Count).
+
+get_only_item(Nidx, From) ->
+    node_flat:get_only_item(Nidx, From).
 
 get_item(Nidx, ItemId) ->
     node_flat:get_item(Nidx, ItemId).

@@ -1,11 +1,11 @@
 %%%-------------------------------------------------------------------
 %%% File    : mod_sip_proxy.erl
 %%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% Purpose : 
+%%% Purpose :
 %%% Created : 21 Apr 2014 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2014-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2014-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -20,8 +20,9 @@
 %%% You should have received a copy of the GNU General Public License along
 %%% with this program; if not, write to the Free Software Foundation, Inc.,
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
+%%%
 %%%-------------------------------------------------------------------
+
 -module(mod_sip_proxy).
 
 -ifndef(SIP).
@@ -37,7 +38,6 @@
 	 handle_sync_event/4, handle_info/3, terminate/3,
 	 code_change/4]).
 
--include("ejabberd.hrl").
 -include("logger.hrl").
 -include_lib("esip/include/esip.hrl").
 
@@ -269,10 +269,10 @@ cancel_pending_transactions(State) ->
     lists:foreach(fun esip:cancel/1, State#state.tr_ids).
 
 add_certfile(LServer, Opts) ->
-    case ejabberd_config:get_option({domain_certfile, LServer}) of
-	CertFile when is_binary(CertFile), CertFile /= <<"">> ->
+    case ejabberd_pkix:get_certfile(LServer) of
+	{ok, CertFile} ->
 	    [{certfile, CertFile}|Opts];
-	_ ->
+	error ->
 	    Opts
     end.
 
@@ -297,7 +297,7 @@ add_record_route_and_set_uri(URI, LServer, #sip{hdrs = Hdrs} = Req) ->
 	    case need_record_route(LServer) of
 		true ->
 		    RR_URI = get_configured_record_route(LServer),
-		    TS = (integer_to_binary(p1_time_compat:system_time(seconds))),
+		    TS = (integer_to_binary(erlang:system_time(second))),
 		    Sign = make_sign(TS, Hdrs),
 		    User = <<TS/binary, $-, Sign/binary>>,
 		    NewRR_URI = RR_URI#uri{user = User},
@@ -315,7 +315,7 @@ is_request_within_dialog(#sip{hdrs = Hdrs}) ->
     esip:has_param(<<"tag">>, Params).
 
 need_record_route(LServer) ->
-    gen_mod:get_module_opt(LServer, mod_sip, always_record_route, true).
+    mod_sip_opt:always_record_route(LServer).
 
 make_sign(TS, Hdrs) ->
     {_, #uri{user = FUser, host = FServer}, FParams} = esip:get_hdr('from', Hdrs),
@@ -326,7 +326,7 @@ make_sign(TS, Hdrs) ->
     LTServer = safe_nameprep(TServer),
     FromTag = esip:get_param(<<"tag">>, FParams),
     CallID = esip:get_hdr('call-id', Hdrs),
-    SharedKey = ejabberd_config:get_option(shared_key),
+    SharedKey = ejabberd_config:get_shared_key(),
     str:sha([SharedKey, LFUser, LFServer, LTUser, LTServer,
 		FromTag, CallID, TS]).
 
@@ -334,7 +334,7 @@ is_signed_by_me(TS_Sign, Hdrs) ->
     try
 	[TSBin, Sign] = str:tokens(TS_Sign, <<"-">>),
 	TS = (binary_to_integer(TSBin)),
-	NowTS = p1_time_compat:system_time(seconds),
+	NowTS = erlang:system_time(second),
 	true = (NowTS - TS) =< ?SIGN_LIFETIME,
 	Sign == make_sign(TSBin, Hdrs)
     catch _:_ ->
@@ -342,17 +342,13 @@ is_signed_by_me(TS_Sign, Hdrs) ->
     end.
 
 get_configured_vias(LServer) ->
-    gen_mod:get_module_opt(LServer, mod_sip, via, []).
+    mod_sip_opt:via(LServer).
 
 get_configured_record_route(LServer) ->
-    gen_mod:get_module_opt(
-      LServer, mod_sip, record_route,
-      #uri{host = LServer, params = [{<<"lr">>, <<"">>}]}).
+    mod_sip_opt:record_route(LServer).
 
 get_configured_routes(LServer) ->
-    gen_mod:get_module_opt(
-      LServer, mod_sip, routes,
-      [#uri{host = LServer, params = [{<<"lr">>, <<"">>}]}]).
+    mod_sip_opt:routes(LServer).
 
 mark_transaction_as_complete(TrID, State) ->
     NewTrIDs = lists:delete(TrID, State#state.tr_ids),

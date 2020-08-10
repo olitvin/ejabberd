@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,7 +28,7 @@
 -behaviour(mod_muc_room).
 
 %% API
--export([init/2, import/3, store_room/4, restore_room/3, forget_room/3,
+-export([init/2, import/3, store_room/5, restore_room/3, forget_room/3,
 	 can_use_nick/4, get_rooms/2, get_nick/3, set_nick/4]).
 -export([register_online_room/4, unregister_online_room/4, find_online_room/3,
 	 get_online_rooms/3, count_online_rooms/2, rsm_supported/0,
@@ -63,7 +63,7 @@ start_link(Host, Opts) ->
     Name = gen_mod:get_module_proc(Host, ?MODULE),
     gen_server:start_link({local, Name}, ?MODULE, [Host, Opts], []).
 
-store_room(_LServer, Host, Name, Opts) ->
+store_room(_LServer, Host, Name, Opts, _) ->
     F = fun () ->
 		mnesia:write(#muc_room{name_host = {Name, Host},
 				       opts = Opts})
@@ -262,16 +262,17 @@ unregister_online_user(_ServerHost, {U, S, R}, Room, Host) ->
 		      #muc_online_users{us = {U, S}, resource = R,
 					room = Room, host = Host}).
 
-count_online_rooms_by_user(_ServerHost, U, S) ->
+count_online_rooms_by_user(ServerHost, U, S) ->
+    MucHost = hd(gen_mod:get_module_opt_hosts(ServerHost, mod_muc)),
     ets:select_count(
       muc_online_users,
       ets:fun2ms(
-	fun(#muc_online_users{us = {U1, S1}}) ->
-		U == U1 andalso S == S1
+	fun(#muc_online_users{us = {U1, S1}, host = Host}) ->
+		U == U1 andalso S == S1 andalso MucHost == Host
 	end)).
 
 get_online_rooms_by_user(ServerHost, U, S) ->
-    MucHost = gen_mod:get_module_opt_host(ServerHost, mod_muc, <<"conference.@HOST@">>),
+    MucHost = hd(gen_mod:get_module_opt_hosts(ServerHost, mod_muc)),
     ets:select(
       muc_online_users,
       ets:fun2ms(
@@ -295,9 +296,9 @@ import(_LServer, <<"muc_registered">>,
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
-init([Host, Opts]) ->
-    MyHosts = proplists:get_value(hosts, Opts),
-    case gen_mod:db_mod(Host, Opts, mod_muc) of
+init([_Host, Opts]) ->
+    MyHosts = mod_muc_opt:hosts(Opts),
+    case gen_mod:db_mod(Opts, mod_muc) of
 	?MODULE ->
 	    ejabberd_mnesia:create(?MODULE, muc_room,
 				   [{disc_copies, [node()]},
@@ -311,7 +312,7 @@ init([Host, Opts]) ->
 	_ ->
 	    ok
     end,
-    case gen_mod:ram_db_mod(Host, Opts, mod_muc) of
+    case gen_mod:ram_db_mod(Opts, mod_muc) of
 	?MODULE ->
 	    ejabberd_mnesia:create(?MODULE, muc_online_room,
 				   [{ram_copies, [node()]},
@@ -328,18 +329,21 @@ init([Host, Opts]) ->
     end,
     {ok, #state{}}.
 
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+handle_call(Request, From, State) ->
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Request]),
+    {noreply, State}.
 
-handle_cast(_Msg, State) ->
+handle_cast(Msg, State) ->
+    ?WARNING_MSG("Unexpected cast: ~p", [Msg]),
     {noreply, State}.
 
 handle_info({mnesia_system_event, {mnesia_down, Node}}, State) ->
     clean_table_from_bad_node(Node),
     {noreply, State};
+handle_info({mnesia_system_event, {mnesia_up, _Node}}, State) ->
+    {noreply, State};
 handle_info(Info, State) ->
-    ?ERROR_MSG("unexpected info: ~p", [Info]),
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -379,11 +383,11 @@ clean_table_from_bad_node(Node, Host) ->
         end,
     mnesia:async_dirty(F).
 
-need_transform(#muc_room{name_host = {N, H}})
+need_transform({muc_room, {N, H}, _})
   when is_list(N) orelse is_list(H) ->
     ?INFO_MSG("Mnesia table 'muc_room' will be converted to binary", []),
     true;
-need_transform(#muc_registered{us_host = {{U, S}, H}, nick = Nick})
+need_transform({muc_registered, {{U, S}, H}, Nick})
   when is_list(U) orelse is_list(S) orelse is_list(H) orelse is_list(Nick) ->
     ?INFO_MSG("Mnesia table 'muc_registered' will be converted to binary", []),
     true;

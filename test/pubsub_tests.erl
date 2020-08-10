@@ -3,7 +3,7 @@
 %%% Created : 16 Nov 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,6 +30,7 @@
 		recv_message/1, my_jid/1, send/2, recv_presence/1, recv/1]).
 
 -include("suite.hrl").
+-include_lib("stdlib/include/assert.hrl").
 
 %%%===================================================================
 %%% API
@@ -55,6 +56,7 @@ single_cases() ->
       single_test(test_delete_item),
       single_test(test_purge),
       single_test(test_subscribe),
+      single_test(test_subscribe_max_item_1),
       single_test(test_unsubscribe)]}.
 
 test_features(Config) ->
@@ -86,7 +88,8 @@ test_features(Config) ->
 test_vcard(Config) ->
     JID = pubsub_jid(Config),
     ct:comment("Retreiving vCard from ~s", [jid:encode(JID)]),
-    #iq{type = result, sub_els = [#vcard_temp{}]} =
+    VCard = mod_pubsub_opt:vcard(?config(server, Config)),
+    #iq{type = result, sub_els = [VCard]} =
 	send_recv(Config, #iq{type = get, to = JID, sub_els = [#vcard_temp{}]}),
     disconnect(Config).
 
@@ -108,7 +111,7 @@ test_configure(Config) ->
 			    [{title, NodeTitle}]),
     set_node_config(Config, Node, MyNodeConfig),
     NewNodeConfig = get_node_config(Config, Node),
-    NodeTitle = proplists:get_value(title, NewNodeConfig),
+    NodeTitle = proplists:get_value(title, NewNodeConfig, <<>>),
     disconnect(Config).
 
 test_default(Config) ->
@@ -122,7 +125,7 @@ test_create_configure(Config) ->
 				[{title, NodeTitle}]),
     Node = create_node(Config, <<>>, CustomNodeConfig),
     NodeConfig = get_node_config(Config, Node),
-    NodeTitle = proplists:get_value(title, NodeConfig),
+    NodeTitle = proplists:get_value(title, NodeConfig, <<>>),
     delete_node(Config, Node),
     disconnect(Config).
 
@@ -133,7 +136,7 @@ test_publish(Config) ->
     disconnect(Config).
 
 test_auto_create(Config) ->
-    Node = randoms:get_string(),
+    Node = p1_rand:get_string(),
     publish_item(Config, Node),
     delete_node(Config, Node),
     disconnect(Config).
@@ -163,6 +166,16 @@ test_subscribe(Config) ->
     delete_node(Config, Node),
     disconnect(Config).
 
+test_subscribe_max_item_1(Config) ->
+    DefaultNodeConfig = get_default_node_config(Config),
+    CustomNodeConfig = set_opts(DefaultNodeConfig,
+				[{max_items, 1}]),
+    Node = create_node(Config, <<>>, CustomNodeConfig),
+    #ps_subscription{type = subscribed} = subscribe_node(Config, Node),
+    [#ps_subscription{node = Node}] = get_subscriptions(Config),
+    delete_node(Config, Node),
+    disconnect(Config).
+
 test_unsubscribe(Config) ->
     Node = create_node(Config, <<>>),
     subscribe_node(Config, Node),
@@ -175,8 +188,8 @@ test_unsubscribe(Config) ->
 test_get_affiliations(Config) ->
     Nodes = lists:sort([create_node(Config, <<>>) || _ <- lists:seq(1, 5)]),
     Affs = get_affiliations(Config),
-    Nodes = lists:sort([Node || #ps_affiliation{node = Node,
-						type = owner} <- Affs]),
+    ?assertEqual(Nodes, lists:sort([Node || #ps_affiliation{node = Node,
+						type = owner} <- Affs])),
     [delete_node(Config, Node) || Node <- Nodes],
     disconnect(Config).
 
@@ -184,7 +197,7 @@ test_get_subscriptions(Config) ->
     Nodes = lists:sort([create_node(Config, <<>>) || _ <- lists:seq(1, 5)]),
     [subscribe_node(Config, Node) || Node <- Nodes],
     Subs = get_subscriptions(Config),
-    Nodes = lists:sort([Node || #ps_subscription{node = Node} <- Subs]),
+    ?assertEqual(Nodes, lists:sort([Node || #ps_subscription{node = Node} <- Subs])),
     [delete_node(Config, Node) || Node <- Nodes],
     disconnect(Config).
 
@@ -217,7 +230,7 @@ master_slave_cases() ->
 publish_master(Config) ->
     Node = create_node(Config, <<>>),
     put_event(Config, Node),
-    wait_for_slave(Config),
+    ready = get_event(Config),
     #ps_item{id = ID} = publish_item(Config, Node),
     #ps_item{id = ID} = get_event(Config),
     delete_node(Config, Node),
@@ -226,7 +239,7 @@ publish_master(Config) ->
 publish_slave(Config) ->
     Node = get_event(Config),
     subscribe_node(Config, Node),
-    wait_for_master(Config),
+    put_event(Config, ready),
     #message{
        sub_els =
 	   [#ps_event{
@@ -287,7 +300,7 @@ affiliations_master(Config) ->
     lists:foreach(
       fun(Aff) ->
 	      Node = <<(atom_to_binary(Aff, utf8))/binary,
-		       $-, (randoms:get_string())/binary>>,
+		       $-, (p1_rand:get_string())/binary>>,
 	      create_node(Config, Node, default_node_config(Config)),
 	      #ps_item{id = I} = publish_item(Config, Node),
 	      ok = set_affiliations(Config, Node, [{Peer, Aff}]),
@@ -598,8 +611,8 @@ set_node_config(Config, Node, Options) ->
 
 publish_item(Config, Node) ->
     PJID = pubsub_jid(Config),
-    ItemID = randoms:get_string(),
-    Item = #ps_item{id = ItemID, xml_els = [xmpp:encode(#presence{id = ItemID})]},
+    ItemID = p1_rand:get_string(),
+    Item = #ps_item{id = ItemID, sub_els = [xmpp:encode(#presence{id = ItemID})]},
     case send_recv(Config,
 		   #iq{type = set, to = PJID,
 		       sub_els = [#pubsub{publish = #ps_publish{

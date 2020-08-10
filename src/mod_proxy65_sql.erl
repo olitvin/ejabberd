@@ -1,9 +1,9 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created : 30 Mar 2017 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -23,12 +23,10 @@
 -module(mod_proxy65_sql).
 -behaviour(mod_proxy65).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/0, register_stream/2, unregister_stream/1, activate_stream/4]).
 
--include("ejabberd.hrl").
 -include("logger.hrl").
 -include("ejabberd_sql_pt.hrl").
 
@@ -39,13 +37,13 @@ init() ->
     NodeS = erlang:atom_to_binary(node(), latin1),
     ?DEBUG("Cleaning SQL 'proxy65' table...", []),
     case ejabberd_sql:sql_query(
-	   ?MYNAME,
+	   ejabberd_config:get_myname(),
 	   ?SQL("delete from proxy65 where "
 		"node_i=%(NodeS)s or node_t=%(NodeS)s")) of
 	{updated, _} ->
 	    ok;
 	Err ->
-	    ?ERROR_MSG("failed to clean 'proxy65' table: ~p", [Err]),
+	    ?ERROR_MSG("Failed to clean 'proxy65' table: ~p", [Err]),
 	    Err
     end.
 
@@ -65,11 +63,10 @@ register_stream(SID, Pid) ->
 			       "values (%(SID)s, %(PidS)s, %(NodeS)s, '', '', '')"))
 		end
 	end,
-    case ejabberd_sql:sql_transaction(?MYNAME, F) of
+    case ejabberd_sql:sql_transaction(ejabberd_config:get_myname(), F) of
 	{atomic, _} ->
 	    ok;
 	{aborted, Reason} ->
-	    ?ERROR_MSG("failed to register stream: ~p", [Reason]),
 	    {error, Reason}
     end.
 
@@ -78,11 +75,10 @@ unregister_stream(SID) ->
 		ejabberd_sql:sql_query_t(
 		  ?SQL("delete from proxy65 where sid=%(SID)s"))
 	end,
-    case ejabberd_sql:sql_transaction(?MYNAME, F) of
+    case ejabberd_sql:sql_transaction(ejabberd_config:get_myname(), F) of
 	{atomic, _} ->
 	    ok;
 	{aborted, Reason} ->
-	    ?ERROR_MSG("failed to unregister stream: ~p", [Reason]),
 	    {error, Reason}
     end.
 
@@ -127,13 +123,12 @@ activate_stream(SID, IJID, MaxConnections, _Node) ->
 			ejabberd_sql:abort(Err)
 		end
 	end,
-    case ejabberd_sql:sql_transaction(?MYNAME, F) of
+    case ejabberd_sql:sql_transaction(ejabberd_config:get_myname(), F) of
 	{atomic, Result} ->
 	    Result;
 	{aborted, {limit, _, _} = Limit} ->
 	    {error, Limit};
 	{aborted, Reason} ->
-	    ?ERROR_MSG("failed to activate bytestream: ~p", [Reason]),
 	    {error, Reason}
     end.
 

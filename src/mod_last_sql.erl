@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2020   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,7 +26,6 @@
 
 -behaviour(mod_last).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/2, get_last/2, store_last_info/4, remove_user/2,
@@ -46,43 +45,45 @@ get_last(LUser, LServer) ->
     case ejabberd_sql:sql_query(
 	   LServer,
 	   ?SQL("select @(seconds)d, @(state)s from last"
-		" where username=%(LUser)s")) of
+		" where username=%(LUser)s and %(LServer)H")) of
         {selected, []} ->
 	    error;
         {selected, [{TimeStamp, Status}]} ->
             {ok, {TimeStamp, Status}};
-        Reason ->
-	    ?ERROR_MSG("failed to get last for user ~s@~s: ~p",
-		       [LUser, LServer, Reason]),
+        _Reason ->
 	    {error, db_failure}
     end.
 
 store_last_info(LUser, LServer, TimeStamp, Status) ->
+    TS = integer_to_binary(TimeStamp),
     case ?SQL_UPSERT(LServer, "last",
 		     ["!username=%(LUser)s",
-		      "seconds=%(TimeStamp)d",
+                      "!server_host=%(LServer)s",
+		      "seconds=%(TS)s",
 		      "state=%(Status)s"]) of
 	ok ->
 	    ok;
-	Err ->
-	    ?ERROR_MSG("failed to store last activity for ~s@~s: ~p",
-		       [LUser, LServer, Err]),
+	_Err ->
 	    {error, db_failure}
     end.
 
 remove_user(LUser, LServer) ->
     ejabberd_sql:sql_query(
       LServer,
-      ?SQL("delete from last where username=%(LUser)s")).
+      ?SQL("delete from last where username=%(LUser)s and %(LServer)H")).
 
 export(_Server) ->
     [{last_activity,
       fun(Host, #last_activity{us = {LUser, LServer},
                                timestamp = TimeStamp, status = Status})
             when LServer == Host ->
-              [?SQL("delete from last where username=%(LUser)s;"),
-               ?SQL("insert into last(username, seconds, state)"
-                    " values (%(LUser)s, %(TimeStamp)d, %(Status)s);")];
+              TS = integer_to_binary(TimeStamp),
+              [?SQL("delete from last where username=%(LUser)s and %(LServer)H;"),
+               ?SQL_INSERT("last",
+                           ["username=%(LUser)s",
+                            "server_host=%(LServer)s",
+                            "seconds=%(TS)s",
+                            "state=%(Status)s"])];
          (_Host, _R) ->
               []
       end}].
