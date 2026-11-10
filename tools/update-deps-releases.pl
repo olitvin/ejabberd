@@ -7,12 +7,15 @@ use warnings;
 use File::Slurp qw(slurp write_file);
 use File::stat;
 use File::Touch;
+use File::chdir;
+use File::Spec;
 use Data::Dumper qw(Dumper);
 use Carp;
 use Term::ANSIColor;
 use Term::ReadKey;
-use List::Util qw(first unpairs);
+use List::Util qw(first);
 use Clone qw(clone);
+use LWP::UserAgent;
 
 sub get_deps {
     my ($config, %fdeps) = @_;
@@ -62,7 +65,7 @@ sub update_deps_repos {
             say "Downloading $dep...";
             my $repo = $deps->{$dep}->{repo};
             $repo =~ s!^https?://github.com/!git\@github.com:!;
-            system("git", "-C", ".deps-update", "clone", $repo);
+            system("git", "-C", ".deps-update", "clone", $repo, $dep);
         } elsif (time() - stat($dd)->mtime > 24 * 60 * 60 or $force) {
             say "Updating $dep...";
             system("git", "-C", $dd, "pull");
@@ -150,6 +153,8 @@ sub edit_changelog {
     } else {
         $content =~ s/(# Version $version\n\n)/$1* \n/;
     }
+    my $changes = join "\n", map {"# $_"} @{$git_info->{$dep}->{new_commits}};
+    $content = "$changes\n\n$content";
     write_file($cl, $content);
 
     system("$ENV{EDITOR} $cl");
@@ -158,6 +163,8 @@ sub edit_changelog {
     if ($new_content eq $content) {
         write_file($cl, $old_content);
     } else {
+        $new_content =~ s/^(\# (?!VERSION).*\n)+\n//;
+        write_file($cl, $new_content);
         system("git", "-C", ".deps-update/$dep", "commit", "-a", "-m", "Update changelog");
     }
 }
@@ -167,7 +174,7 @@ sub update_app_src {
     my $app = ".deps-update/$dep/src/$dep.app.src";
     return if not -f $app;
     my $content = slurp($app);
-    $content =~ s/({\s*vsn\s*,\s*)".*"/$1"$version"/;
+    $content =~ s/(\{\s*vsn\s*,\s*)".*"/$1"$version"/;
     write_file($app, $content);
 }
 
@@ -176,7 +183,7 @@ sub update_deps_versions {
     my $config = slurp $config_path;
 
     for (keys %deps) {
-        $config =~ s/(\{\s*$_\s*,\s*".*?"\s*,\s*\{\s*git\s*,\s*".*?"\s*,\s*)(?:{\s*tag\s*,\s*"(.*?)"\s*}|"(.*?)")/$1\{tag, "$deps{$_}"}/s;
+        $config =~ s/(\{\s*$_\s*,\s*")(?:.*?)("\s*,\s*\{\s*git\s*,\s*".*?"\s*,\s*)(?:{\s*tag\s*,\s*"(.*?)"\s*}|"(.*?)")/$1~> $deps{$_}$2\{tag, "$deps{$_}"}/s;
     }
 
     write_file($config_path, $config);
@@ -202,7 +209,7 @@ sub cmp_ver {
                     return 1 if $ap > $bp;
                     return - 1;
                 } else {
-                    next if $ap eq $bp;
+                    next if $ap eq $bp or $ap eq "" or $bp eq "";
                     return 1 if $ap gt $bp;
                     return - 1;
                 }
@@ -233,6 +240,15 @@ sub deps_git_info {
             my $new_tag = $last_tag;
             $new_tag =~ s/(\d+)$/$1+1/e;
             chomp(@new);
+
+            my $cl = ".deps-update/$dep/CHANGELOG.md";
+            my $content = slurp($cl, err_mode => "quiet") // "";
+            if ($content =~ /^# Version (\S+)/) {
+                if (!grep({$_ eq $1} @tags) && $1 ne $new_tag) {
+                    $new_tag = $1;
+                }
+            }
+
             $info{$dep} = { last_tag => $last_tag, new_commits => \@new, new_tag => $new_tag };
         }
     }
@@ -250,12 +266,18 @@ sub show_commands {
         say color("red"), $_, color("reset"), ") $commands{$_}";
     }
     ReadMode(4);
+    my $wkey = "";
     while (1) {
         my $key = ReadKey(0);
+        $wkey = substr($wkey.$key, -2);
         if (defined $commands{uc($key)}) {
             ReadMode(0);
             say "";
             return uc($key);
+        } elsif (defined $commands{uc($wkey)}) {
+            ReadMode(0);
+            say "";
+            return uc($wkey);
         }
     }
 }
@@ -314,13 +336,51 @@ sub git_tag {
     my ($dep, $ver, $msg) = @_;
 
     system("git", "-C", ".deps-update/$dep", "commit", "-a", "-m", $msg);
-    system("git", "-C", ".deps-update/$dep", "tag", $ver);
+    system("git", "-C", ".deps-update/$dep", "tag", $ver, "-a", "-m", $msg);
 }
 
 sub git_push {
     my ($dep) = @_;
     system("git", "-C", ".deps-update/$dep", "push");
     system("git", "-C", ".deps-update/$dep", "push", "--tags");
+}
+
+sub check_hex_files {
+    my ($dep) = @_;
+    my $app = ".deps-update/$dep/src/$dep.app.src";
+    return if not -f $app;
+    my $content = slurp($app);
+    my @paths;
+    if ($content =~ /{\s*files\s*,\s*\[([^\]]+)\]/) {
+        my $list = $1;
+        push @paths, $1 while $list =~ /"([^"]*?)"/g;
+    } else {
+        @paths = (
+            "src", "c_src", "include", "rebar.config.script", "priv",
+            "rebar.config", "rebar.lock", "README*", "readme*", "LICENSE*",
+            "license*", "NOTICE");
+    }
+    local $CWD = ".deps-update/$dep";
+    my @interesting_files = map {File::Spec->canonpath($_)} glob("rebar.config* src/*.erl src/*.app.src c_src/*.c c_src/*.cpp \
+        c_src/*.h c_src/*.hpp include/*.hrl");
+
+    my @matching_files;
+    for my $path (@paths) {
+        if (-d $path) {
+            push @matching_files, map {File::Spec->canonpath($_)} glob("$path/*");
+        } else {
+            push @matching_files, map {File::Spec->canonpath($_)} glob($path);
+        }
+    }
+    my %diff;
+    @diff{ @interesting_files } = undef;
+    delete @diff{ @matching_files };
+    my @diff = keys %diff;
+    if (@diff) {
+        print color("red"), "Dependency ", color("bold red"), $dep, color("reset"), color("red"), " files section doesn't match: ",
+            join(" ", @diff), color("reset"), "\n";
+
+    }
 }
 
 update_deps_repos();
@@ -350,10 +410,15 @@ while (1) {
     say "(none)" if not $changed_deps;
     say "";
 
+    for my $dep (sort keys %$top_deps) {
+        check_hex_files($dep);
+    }
+
     my $cmd = show_commands($old_deps ? (U => "Update dependency") : (),
         $changed_deps ? (T => "Tag new release") : (),
         @operations ? (A => "Apply changes") : (),
-        R => "Refresh repositiories",
+        R => "Refresh repositories",
+        H => "What release to Hex",
         E => "Exit");
     last if $cmd eq "E";
 
@@ -382,15 +447,32 @@ while (1) {
     if ($cmd eq "R") {
         update_deps_repos(1);
     }
+    if ($cmd eq "H") {
+        my $ua = LWP::UserAgent->new();
+        for my $dep (sort keys %$top_deps) {
+            say "checking https://hex.pm/packages/$dep/$git_info->{$dep}->{last_tag}";
+            my $res = $ua->head("https://hex.pm/packages/$dep/$git_info->{$dep}->{last_tag}");
+            if ($res->code == 404) {
+                say color("red"), "$dep", color("reset"), " ($top_deps->{$dep}->{commit})";
+            }
+        }
+    }
     if ($cmd eq "T") {
         while (1) {
             my @deps_to_tag;
             my @od;
             my $idx = 1;
+            my $count = 0;
+            for my $dep (sort keys %$top_deps) {
+                next unless @{$git_info->{$dep}->{new_commits}};
+                $count++;
+            }
             for my $dep (sort keys %$top_deps) {
                 next unless @{$git_info->{$dep}->{new_commits}};
                 $od[$idx] = $dep;
-                push @deps_to_tag, $idx++, "Tag $dep with version $git_info->{$dep}->{new_tag}";
+                my $id = $idx++;
+                $id = sprintf "%02d", $id if $count > 9;
+                push @deps_to_tag, $id, "Tag $dep with version $git_info->{$dep}->{new_tag}";
             }
             last if $idx == 1;
             my $cmd = show_commands(@deps_to_tag, E => "Exit");
@@ -467,7 +549,7 @@ while (1) {
                 for my $op (@operations) {
                     update_changelog($op->{dep}, $op->{version}, @{$op->{reasons}})
                         if @{$op->{reasons}};
-                    update_deps_versions(".deps-update/$op->{dep}/rebar.config", unpairs(@{$op->{operations}}))
+                    update_deps_versions(".deps-update/$op->{dep}/rebar.config", map {@{$_}[0,1] } @{$op->{operations}})
                         if @{$op->{operations}};
                     if ($git_info->{$op->{dep}}->{last_tag} ne $op->{version}) {
                         update_app_src($op->{dep}, $op->{version});

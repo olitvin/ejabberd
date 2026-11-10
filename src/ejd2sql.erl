@@ -5,7 +5,7 @@
 %%% Created : 22 Aug 2005 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -51,7 +51,6 @@ modules() ->
     [ejabberd_auth,
      mod_announce,
      mod_caps,
-     mod_irc,
      mod_last,
      mod_mam,
      mod_muc,
@@ -59,6 +58,7 @@ modules() ->
      mod_privacy,
      mod_private,
      mod_pubsub,
+     mod_push,
      mod_roster,
      mod_shared_roster,
      mod_vcard].
@@ -73,18 +73,36 @@ export(Server, Output) ->
       end, Modules),
     close_output(Output, IO).
 
-export(Server, Output, Module) ->
+export(Server, Output, mod_mam = M1) ->
+    MucServices = case gen_mod:is_loaded(Server, mod_muc) of
+        true -> gen_mod:get_module_opt_hosts(Server, mod_muc);
+        false -> []
+    end,
+    [export2(MucService, Output, M1, M1) || MucService <- MucServices],
+    export2(Server, Output, M1, M1);
+export(Server, Output, mod_pubsub = M1) ->
+    export2(Server, Output, M1, pubsub_db);
+export(Server, Output, M1) ->
+    export2(Server, Output, M1, M1).
+
+export2(Server, Output, Module1, Module) ->
+    SQLMod = gen_mod:db_mod(sql, Module),
     LServer = jid:nameprep(iolist_to_binary(Server)),
     IO = prepare_output(Output),
     lists:foreach(
       fun({Table, ConvertFun}) ->
               case export(LServer, Table, IO, ConvertFun) of
                   {atomic, ok} -> ok;
+		  {aborted, {no_exists, _}} ->
+		      ?WARNING_MSG("Ignoring export for module ~ts: "
+				   "Mnesia table ~ts doesn't exist (most likely "
+				   "because the module is unused)",
+				   [Module1, Table]);
                   {aborted, Reason} ->
                       ?ERROR_MSG("Failed export for module ~p and table ~p: ~p",
                                  [Module, Table, Reason])
               end
-      end, Module:export(Server)),
+      end, SQLMod:export(Server)),
     close_output(Output, IO).
 
 delete(Server) ->
@@ -94,17 +112,22 @@ delete(Server) ->
               delete(Server, Module)
       end, Modules).
 
-delete(Server, Module) ->
+delete(Server, Module1) ->
     LServer = jid:nameprep(iolist_to_binary(Server)),
+    Module = case Module1 of
+		 mod_pubsub -> pubsub_db;
+		 _ -> Module1
+	     end,
+    SQLMod = gen_mod:db_mod(sql, Module),
     lists:foreach(
       fun({Table, ConvertFun}) ->
               delete(LServer, Table, ConvertFun)
-      end, Module:export(Server)).
+      end, SQLMod:export(Server)).
 
 import(Server, Dir, ToType) ->
     lists:foreach(
       fun(Mod) ->
-              ?INFO_MSG("importing ~p...", [Mod]),
+              ?INFO_MSG("Importing ~p...", [Mod]),
               import(Mod, Server, Dir, ToType)
       end, modules()).
 
@@ -123,9 +146,9 @@ import(Mod, Server, Dir, ToType) ->
                   {error, enoent} ->
                       ok;
                   eof ->
-                      ?INFO_MSG("It seems like SQL dump ~s is empty", [FileName]);
+                      ?INFO_MSG("It seems like SQL dump ~ts is empty", [FileName]);
                   Err ->
-                      ?ERROR_MSG("Failed to open SQL dump ~s: ~s",
+                      ?ERROR_MSG("Failed to open SQL dump ~ts: ~ts",
                                  [FileName, format_error(Err)])
               end
       end, import_info(Mod)),
@@ -144,16 +167,23 @@ import_info(Mod) ->
 %%% Internal functions
 %%%----------------------------------------------------------------------
 export(LServer, Table, IO, ConvertFun) ->
+    DbType = ejabberd_option:sql_type(LServer),
+    LServerConvert = case Table of
+                         archive_msg ->
+                             [LServer | mod_muc_admin:find_hosts(LServer)];
+                         _ ->
+                             LServer
+                     end,
     F = fun () ->
                 mnesia:read_lock_table(Table),
                 {_N, SQLs} =
                     mnesia:foldl(
                       fun(R, {N, SQLs} = Acc) ->
-                              case ConvertFun(LServer, R) of
+                              case ConvertFun(LServerConvert, R) of
                                   [] ->
                                       Acc;
                                   SQL1 ->
-                                      SQL = format_queries(SQL1),
+                                      SQL = format_queries(DbType, SQL1),
                                       if N < (?MAX_RECORDS_PER_TRANSACTION) - 1 ->
                                               {N + 1, [SQL | SQLs]};
                                          true ->
@@ -181,7 +211,7 @@ output(_LServer, Table, Fd, SQLs) ->
 delete(LServer, Table, ConvertFun) ->
     F = fun () ->
                 mnesia:write_lock_table(Table),
-                {_N, SQLs} =
+                {_N, _SQLs} =
                     mnesia:foldl(
                       fun(R, Acc) ->
                               case ConvertFun(LServer, R) of
@@ -192,8 +222,7 @@ delete(LServer, Table, ConvertFun) ->
                                       Acc
                               end
                       end,
-                      {0, []}, Table),
-                delete(LServer, Table, SQLs)
+                      {0, []}, Table)
         end,
     mnesia:transaction(F).
 
@@ -206,6 +235,10 @@ prepare_output(FileName, normal) when is_list(FileName) ->
     case file:open(FileName, [write, raw]) of
         {ok, Fd} ->
             Fd;
+        {error, eacces} ->
+            exit({"Not enough permission to the file or path", FileName});
+        {error, enoent} ->
+            exit({"Path does not exist", FileName});
         Err ->
             exit(Err)
     end;
@@ -246,7 +279,7 @@ import_rows(LServer, FromType, ToType, Tab, Mod, Dump, FieldsNumber) ->
         eof ->
             ok;
         Err ->
-            ?ERROR_MSG("Failed to read row from SQL dump: ~s",
+            ?ERROR_MSG("Failed to read row from SQL dump: ~ts",
                        [format_error(Err)])
     end.
 
@@ -354,10 +387,10 @@ format_error({error, eof}) ->
 format_error({error, Posix}) ->
     file:format_error(Posix).
 
-format_queries(SQLs) ->
+format_queries(DbType, SQLs) ->
     lists:map(
       fun(#sql_query{} = SQL) ->
-              ejabberd_sql:sql_query_to_iolist(SQL);
+              ejabberd_sql:sql_query_to_iolist(DbType, SQL);
          (SQL) ->
               SQL
       end, SQLs).

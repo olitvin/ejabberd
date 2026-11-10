@@ -6,7 +6,7 @@
 %%% Author:  Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -64,7 +64,7 @@ parse(L) ->
 %%%           RFC2254_Filter = RegExp = Value = string(),
 %%%           N = integer().
 %%%
-%%% Description: The same as parse/1, but substitutes N or all occurences
+%%% Description: The same as parse/1, but substitutes N or all occurrences
 %%%              of RegExp with Value *after* parsing.
 %%%
 %%% Example:
@@ -98,30 +98,30 @@ parse(L, SList) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
--define(do_scan(L), scan(Rest, <<>>, [{L, 1} | check(Buf, S) ++ Result], L, S)).
+-define(DO_SCAN(L), scan(Rest, <<>>, [{L, 1} | check(Buf, S) ++ Result], L, S)).
 
 scan(L, SList) ->
     scan(L, <<"">>, [], undefined, SList).
 
 scan("=*)" ++ Rest, Buf, Result, '(', S) ->
     scan(Rest, <<>>, [{')', 1}, {'=*', 1} | check(Buf, S) ++ Result], ')', S);
-scan(":dn" ++ Rest, Buf, Result, '(', S) -> ?do_scan(':dn');
-scan(":=" ++ Rest, Buf, Result, '(', S) -> ?do_scan(':=');
-scan(":=" ++ Rest, Buf, Result, ':dn', S) -> ?do_scan(':=');
-scan(":=" ++ Rest, Buf, Result, ':', S) -> ?do_scan(':=');
-scan("~=" ++ Rest, Buf, Result, '(', S) -> ?do_scan('~=');
-scan(">=" ++ Rest, Buf, Result, '(', S) -> ?do_scan('>=');
-scan("<=" ++ Rest, Buf, Result, '(', S) -> ?do_scan('<=');
-scan("="  ++ Rest, Buf, Result, '(', S) -> ?do_scan('=');
-scan(":"  ++ Rest, Buf, Result, '(', S) -> ?do_scan(':');
-scan(":"  ++ Rest, Buf, Result, ':dn', S) -> ?do_scan(':');
-scan("&"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?do_scan('&');
-scan("|"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?do_scan('|');
-scan("!"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?do_scan('!');
-scan("*"  ++ Rest, Buf, Result, '*', S) -> ?do_scan('*');
-scan("*"  ++ Rest, Buf, Result, '=', S) -> ?do_scan('*');
-scan("("  ++ Rest, Buf, Result, _, S) -> ?do_scan('(');
-scan(")"  ++ Rest, Buf, Result, _, S) -> ?do_scan(')');
+scan(":dn" ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN(':dn');
+scan(":=" ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN(':=');
+scan(":=" ++ Rest, Buf, Result, ':dn', S) -> ?DO_SCAN(':=');
+scan(":=" ++ Rest, Buf, Result, ':', S) -> ?DO_SCAN(':=');
+scan("~=" ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN('~=');
+scan(">=" ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN('>=');
+scan("<=" ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN('<=');
+scan("="  ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN('=');
+scan(":"  ++ Rest, Buf, Result, '(', S) -> ?DO_SCAN(':');
+scan(":"  ++ Rest, Buf, Result, ':dn', S) -> ?DO_SCAN(':');
+scan("&"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?DO_SCAN('&');
+scan("|"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?DO_SCAN('|');
+scan("!"  ++ Rest, Buf, Result, '(', S) when Buf==<<"">> -> ?DO_SCAN('!');
+scan("*"  ++ Rest, Buf, Result, '*', S) -> ?DO_SCAN('*');
+scan("*"  ++ Rest, Buf, Result, '=', S) -> ?DO_SCAN('*');
+scan("("  ++ Rest, Buf, Result, _, S) -> ?DO_SCAN('(');
+scan(")"  ++ Rest, Buf, Result, _, S) -> ?DO_SCAN(')');
 scan([Letter | Rest], Buf, Result, PreviosAtom, S) ->
     scan(Rest, <<Buf/binary, Letter>>, Result, PreviosAtom, S);
 scan([], Buf, Result, _, S) ->

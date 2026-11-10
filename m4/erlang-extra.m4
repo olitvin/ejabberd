@@ -75,7 +75,7 @@ EOF
 	if test "x`cat conftest.out`" != "xok"; then
 	   AC_MSG_RESULT([failed])
 	   X="`cat conftest.out`"
-	   if test "[$3]" == "warn"; then
+	   if test "[$3]" = "warn"; then
 	      AC_MSG_WARN([$X])
 	   else
 	      AC_MSG_FAILURE([$X])
@@ -84,20 +84,3 @@ EOF
 	   AC_MSG_RESULT([ok])
 	fi
 ]) dnl ERLANG_VERSION_CHECK
-
-AC_DEFUN([ERLANG_DEPRECATED_TYPES_CHECK],
-[		AC_MSG_CHECKING([whether Erlang is using deprecated types])
-		cat > conftest.erl <<EOF
--module(conftest).
-
--record(state, {host = dict:new() :: dict:dict()}).
-EOF
-
-	if $ERLC conftest.erl > /dev/null 2>&1; then
-	   AC_MSG_RESULT([no])
-	   AC_SUBST(erlang_deprecated_types, false)
-	else
-	   AC_MSG_RESULT([yes])
-	   AC_SUBST(erlang_deprecated_types, true)
-	fi
-])

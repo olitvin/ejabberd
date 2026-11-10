@@ -4,7 +4,7 @@
 %%% Created : 14 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -31,10 +31,13 @@
 	 set_list/4, get_lists/2, get_list/3, remove_lists/2,
 	 remove_list/3, use_cache/1, import/1]).
 -export([need_transform/1, transform/1]).
+-export([serialize/3, deserialize_start/1, deserialize/2, serialize_privacy_record/1, deserialize_privacy_record/1]).
 
--include("xmpp.hrl").
+-include_lib("xmpp/include/xmpp.hrl").
 -include("mod_privacy.hrl").
 -include("logger.hrl").
+-include_lib("stdlib/include/ms_transform.hrl").
+-include("ejabberd_db_serialize.hrl").
 
 %%%===================================================================
 %%% API
@@ -47,9 +50,7 @@ init(_Host, _Opts) ->
 use_cache(Host) ->
     case mnesia:table_info(privacy, storage_type) of
         disc_only_copies ->
-            gen_mod:get_module_opt(
-              Host, mod_privacy, use_cache,
-              ejabberd_config:use_cache(Host));
+            mod_privacy_opt:use_cache(Host);
         _ ->
             false
     end.
@@ -145,7 +146,7 @@ remove_lists(LUser, LServer) ->
 import(#privacy{} = P) ->
     mnesia:dirty_write(P).
 
-need_transform(#privacy{us = {U, S}}) when is_list(U) orelse is_list(S) ->
+need_transform({privacy, {U, S}, _, _}) when is_list(U) orelse is_list(S) ->
     ?INFO_MSG("Mnesia table 'privacy' will be converted to binary", []),
     true;
 need_transform(_) ->
@@ -177,6 +178,93 @@ transform(#privacy{us = {U, S}, default = Def, lists = Lists} = R) ->
 	     end,
     NewUS = {iolist_to_binary(U), iolist_to_binary(S)},
     R#privacy{us = NewUS, default = NewDef, lists = NewLists}.
+
+serialize_privacy_record(#privacy{us = {U, S}, default = Def, lists = Lists}) ->
+    List2 = lists:map(
+        fun({Name, Rules}) ->
+	    Rules2 = lists:map(
+	        fun(#listitem{type = Type, value = Value, action = Action, order = Order,
+	                      match_all = MA, match_iq = MI, match_message = MM,
+	                      match_presence_in = MPI, match_presence_out = MPO}) ->
+		    Value2 = case Type of
+				jid -> <<"J:", (jid:encode(Value))/binary>>;
+				group -> <<"G:", Value/binary>>;
+				none -> nothing;
+				V -> V
+			    end,
+
+		    {Value2, Action, Order, MA, MI, MM, MPI, MPO}
+		end, Rules),
+	    {Name, Rules2}
+	end, Lists),
+    Def2 = case Def of
+	       none -> <<>>;
+	       _ -> Def
+	   end,
+    #serialize_privacy_v1{serverhost = S, username = U, default = Def2, lists = List2}.
+
+deserialize_privacy_record(#serialize_privacy_v1{serverhost = S, username = U, default = Def, lists = List}) ->
+    List2 = lists:map(
+	fun({Name, Rules}) ->
+	    Rules2 = lists:map(
+		fun({Value, Action, Order, MA, MI, MM, MPI, MPO}) ->
+		    {Type, Value2} = case Value of
+					 <<"J:", J/binary>> ->
+					     {jid, jid:tolower(jid:decode(J))};
+					 <<"G:", G/binary>> -> {group, G};
+					 nothing -> {none, none};
+					 Other -> {subscription, Other}
+				     end,
+		    #listitem{type = Type, value = Value2, action = Action, order = Order,
+		              match_all = MA, match_iq = MI, match_message = MM,
+		              match_presence_in = MPI, match_presence_out = MPO}
+		end, Rules),
+	    {Name, Rules2}
+	end, List),
+    Def2 = case Def of
+	       <<>> -> none;
+	       _ -> Def
+	   end,
+    #privacy{us = {U, S}, default = Def2, lists = List2}.
+
+serialize(LServer, BatchSize, undefined) ->
+    Conv =
+	fun([]) -> skip;
+	   ([#privacy{us = {_, S}} = Priv]) when S == LServer ->
+	       {ok, serialize_privacy_record(Priv)};
+	   (_) -> skip
+	end,
+    ejabberd_db_serialize:iter_records([ejabberd_db_serialize:mnesia_iter(privacy, Conv)],
+				       [], BatchSize);
+serialize(_LServer, BatchSize, Key) ->
+    ejabberd_db_serialize:iter_records(Key, [], BatchSize).
+
+deserialize_start(LServer) ->
+    mnesia:transaction(
+	fun() ->
+	    Keys = mnesia:select(privacy,
+	                         ets:fun2ms(
+				     fun(#privacy{us = US}) when element(2, US) == LServer -> US end)),
+	    lists:foreach(fun(Key) -> mnesia:delete(privacy, Key, write) end, Keys)
+	end),
+    ok.
+
+deserialize(_LServer, Batch) ->
+    F = fun() ->
+	lists:foldl(
+	    fun(_, {error, _} = Err) ->
+		Err;
+	       (#serialize_privacy_v1{} = Ser, _) ->
+		   mnesia:write(deserialize_privacy_record(Ser))
+	    end,
+	    ok,
+	    Batch)
+	end,
+    case mnesia:transaction(F) of
+	{atomic, _} -> ok;
+	{aborted, Reason} ->
+	    {error, iolist_to_binary(io_lib:format("Error when writing privacy data: ~p", [Reason]))}
+    end.
 
 %%%===================================================================
 %%% Internal functions

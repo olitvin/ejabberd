@@ -5,7 +5,7 @@
 %%% Created :  2 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -27,13 +27,14 @@
 
 -author('alexey@process-one.net').
 
--protocol({xep, 54, '1.2'}).
--protocol({xep, 55, '1.3'}).
+-protocol({xep, 54, '1.3.0', '0.1.0', "complete", ""}).
+-protocol({xep, 55, '1.3', '0.1.0', "complete", ""}).
+-protocol({xep, 153, '1.1.1', '17.09', "complete", ""}).
 
 -behaviour(gen_server).
 -behaviour(gen_mod).
 
--export([start/2, stop/1, get_sm_features/5,
+-export([start/2, stop/1, get_sm_features/5, mod_options/1, mod_doc/0,
 	 process_local_iq/1, process_sm_iq/1, string2lower/1,
 	 remove_user/2, export/1, import_info/0, import/5, import_start/2,
 	 depends/2, process_search/1, process_vcard/1, get_vcard/2,
@@ -41,13 +42,19 @@
 	 vcard_iq_set/1, mod_opt_type/1, set_vcard/3, make_vcard_search/4]).
 -export([init/1, handle_call/3, handle_cast/2,
 	 handle_info/2, terminate/2, code_change/3]).
+-export([route/1]).
+-export([webadmin_menu_hostuser/4, webadmin_page_hostuser/4]).
 
--include("ejabberd.hrl").
+-import(ejabberd_web_admin, [make_command/4, make_command/2, make_table/2]).
+
 -include("logger.hrl").
--include("xmpp.hrl").
+-include_lib("xmpp/include/xmpp.hrl").
 -include("mod_vcard.hrl").
+-include("translate.hrl").
 
--define(JUD_MATCHES, 30).
+-include("ejabberd_http.hrl").
+-include("ejabberd_web_admin.hrl").
+
 -define(VCARD_CACHE, vcard_cache).
 
 -callback init(binary(), gen_mod:opts()) -> any().
@@ -81,23 +88,25 @@ stop(Host) ->
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
-init([Host, Opts]) ->
+init([Host|_]) ->
     process_flag(trap_exit, true),
-    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
+    Opts = gen_mod:get_module_opts(Host, ?MODULE),
+    Mod = gen_mod:db_mod(Opts, ?MODULE),
     Mod:init(Host, Opts),
     init_cache(Mod, Host, Opts),
     ejabberd_hooks:add(remove_user, Host, ?MODULE,
 		       remove_user, 50),
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, gen_iq_handler:iqdisc(Host)),
     gen_iq_handler:add_iq_handler(ejabberd_local, Host,
-				  ?NS_VCARD, ?MODULE, process_local_iq, IQDisc),
+				  ?NS_VCARD, ?MODULE, process_local_iq),
     gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
-				  ?NS_VCARD, ?MODULE, process_sm_iq, IQDisc),
+				  ?NS_VCARD, ?MODULE, process_sm_iq),
     ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
 		       get_sm_features, 50),
     ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE, vcard_iq_set, 50),
-    MyHosts = gen_mod:get_opt_hosts(Host, Opts, <<"vjud.@HOST@">>),
-    Search = gen_mod:get_opt(search, Opts, false),
+    ejabberd_hooks:add(webadmin_menu_hostuser, Host, ?MODULE, webadmin_menu_hostuser, 50),
+    ejabberd_hooks:add(webadmin_page_hostuser, Host, ?MODULE, webadmin_page_hostuser, 50),
+    MyHosts = gen_mod:get_opt_hosts(Opts),
+    Search = mod_vcard_opt:search(Opts),
     if Search ->
 	    lists:foreach(
 	      fun(MyHost) ->
@@ -108,22 +117,23 @@ init([Host, Opts]) ->
 		      ejabberd_hooks:add(
 			disco_local_identity, MyHost, ?MODULE, disco_identity, 100),
 		      gen_iq_handler:add_iq_handler(
-			ejabberd_local, MyHost, ?NS_SEARCH, ?MODULE, process_search, IQDisc),
+			ejabberd_local, MyHost, ?NS_SEARCH, ?MODULE, process_search),
 		      gen_iq_handler:add_iq_handler(
-			ejabberd_local, MyHost, ?NS_VCARD, ?MODULE, process_vcard, IQDisc),
+			ejabberd_local, MyHost, ?NS_VCARD, ?MODULE, process_vcard),
 		      gen_iq_handler:add_iq_handler(
 			ejabberd_local, MyHost, ?NS_DISCO_ITEMS, mod_disco,
-			process_local_iq_items, IQDisc),
+			process_local_iq_items),
 		      gen_iq_handler:add_iq_handler(
 			ejabberd_local, MyHost, ?NS_DISCO_INFO, mod_disco,
-			process_local_iq_info, IQDisc),
+			process_local_iq_info),
 		      case Mod:is_search_supported(Host) of
 			  false ->
-			      ?WARNING_MSG("vcard search functionality is "
-					   "not implemented for ~s backend",
-					   [gen_mod:db_type(Host, Opts, ?MODULE)]);
+			      ?WARNING_MSG("vCard search functionality is "
+					   "not implemented for ~ts backend",
+					   [mod_vcard_opt:db_type(Opts)]);
 			  true ->
-			      ejabberd_router:register_route(MyHost, Host)
+			      ejabberd_router:register_route(
+				MyHost, Host, {apply, ?MODULE, route})
 		      end
 	      end, MyHosts);
        true ->
@@ -131,21 +141,25 @@ init([Host, Opts]) ->
     end,
     {ok, #state{hosts = MyHosts, server_host = Host}}.
 
-handle_call(_Call, _From, State) ->
+handle_call(Call, From, State) ->
+    ?WARNING_MSG("Unexpected call from ~p: ~p", [From, Call]),
     {noreply, State}.
 
 handle_cast(Cast, State) ->
-    ?WARNING_MSG("unexpected cast: ~p", [Cast]),
+    ?WARNING_MSG("Unexpected cast: ~p", [Cast]),
     {noreply, State}.
 
 handle_info({route, Packet}, State) ->
-    case catch do_route(Packet) of
-	{'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
-	_ -> ok
+    try route(Packet)
+    catch
+        Class:Reason:StackTrace ->
+            ?ERROR_MSG("Failed to route packet:~n~ts~n** ~ts",
+                       [xmpp:pp(Packet),
+                        misc:format_exception(2, Class, Reason, StackTrace)])
     end,
     {noreply, State};
 handle_info(Info, State) ->
-    ?WARNING_MSG("unexpected info: ~p", [Info]),
+    ?WARNING_MSG("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
 terminate(_Reason, #state{hosts = MyHosts, server_host = Host}) ->
@@ -154,6 +168,8 @@ terminate(_Reason, #state{hosts = MyHosts, server_host = Host}) ->
     gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_VCARD),
     ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE, get_sm_features, 50),
     ejabberd_hooks:delete(vcard_iq_set, Host, ?MODULE, vcard_iq_set, 50),
+    ejabberd_hooks:delete(webadmin_menu_hostuser, Host, ?MODULE, webadmin_menu_hostuser, 50),
+    ejabberd_hooks:delete(webadmin_page_hostuser, Host, ?MODULE, webadmin_page_hostuser, 50),
     Mod = gen_mod:db_mod(Host, ?MODULE),
     Mod:stop(Host),
     lists:foreach(
@@ -171,9 +187,10 @@ terminate(_Reason, #state{hosts = MyHosts, server_host = Host}) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-do_route(#iq{} = IQ) ->
+-spec route(stanza()) -> ok.
+route(#iq{} = IQ) ->
     ejabberd_router:process_iq(IQ);
-do_route(_) ->
+route(_) ->
     ok.
 
 -spec get_sm_features({error, stanza_error()} | empty | {result, [binary()]},
@@ -187,28 +204,33 @@ get_sm_features(Acc, _From, _To, Node, _Lang) ->
       <<"">> ->
 	  case Acc of
 	    {result, Features} ->
-		{result, [?NS_DISCO_INFO, ?NS_VCARD | Features]};
-	    empty -> {result, [?NS_DISCO_INFO, ?NS_VCARD]}
+		{result, [?NS_VCARD | Features]};
+	    empty -> {result, [?NS_VCARD]}
 	  end;
       _ -> Acc
     end.
 
 -spec process_local_iq(iq()) -> iq().
 process_local_iq(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
-process_local_iq(#iq{type = get, lang = Lang} = IQ) ->
-    Desc = translate:translate(Lang, <<"Erlang Jabber Server">>),
-    xmpp:make_iq_result(
-      IQ, #vcard_temp{fn = <<"ejabberd">>,
-		      url = ?EJABBERD_URI,
-		      desc = <<Desc/binary, $\n, ?COPYRIGHT>>,
-		      bday = <<"2002-11-16">>}).
+process_local_iq(#iq{type = get, to = To, lang = Lang} = IQ) ->
+    ServerHost = ejabberd_router:host_of_route(To#jid.lserver),
+    VCard = case mod_vcard_opt:vcard(ServerHost) of
+		undefined ->
+		    #vcard_temp{fn = <<"ejabberd">>,
+				url = ejabberd_config:get_uri(),
+				desc = misc:get_descr(Lang, ?T("Erlang XMPP Server")),
+				bday = <<"2002-11-16">>};
+		V ->
+		    V
+	    end,
+    xmpp:make_iq_result(IQ, VCard).
 
 -spec process_sm_iq(iq()) -> iq().
 process_sm_iq(#iq{type = set, lang = Lang, from = From} = IQ) ->
     #jid{lserver = LServer} = From,
-    case lists:member(LServer, ?MYHOSTS) of
+    case lists:member(LServer, ejabberd_option:hosts()) of
 	true ->
 	    case ejabberd_hooks:run_fold(vcard_iq_set, LServer, IQ, []) of
 		drop -> ignore;
@@ -216,14 +238,14 @@ process_sm_iq(#iq{type = set, lang = Lang, from = From} = IQ) ->
 		_ -> xmpp:make_iq_result(IQ)
 	    end;
 	false ->
-	    Txt = <<"The query is only allowed from local users">>,
+	    Txt = ?T("The query is only allowed from local users"),
 	    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang))
     end;
 process_sm_iq(#iq{type = get, from = From, to = To, lang = Lang} = IQ) ->
     #jid{luser = LUser, lserver = LServer} = To,
     case get_vcard(LUser, LServer) of
 	error ->
-	    Txt = <<"Database failure">>,
+	    Txt = ?T("Database failure"),
 	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang));
 	[] ->
 	    xmpp:make_iq_result(IQ, #vcard_temp{});
@@ -233,14 +255,13 @@ process_sm_iq(#iq{type = get, from = From, to = To, lang = Lang} = IQ) ->
 
 -spec process_vcard(iq()) -> iq().
 process_vcard(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    Txt = ?T("Value 'set' of 'type' attribute is not allowed"),
     xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
 process_vcard(#iq{type = get, lang = Lang} = IQ) ->
-    Desc = translate:translate(Lang, <<"ejabberd vCard module">>),
     xmpp:make_iq_result(
       IQ, #vcard_temp{fn = <<"ejabberd/mod_vcard">>,
-		      url = ?EJABBERD_URI,
-		      desc = <<Desc/binary, $\n, ?COPYRIGHT>>}).
+		      url = ejabberd_config:get_uri(),
+		      desc = misc:get_descr(Lang, ?T("ejabberd vCard module"))}).
 
 -spec process_search(iq()) -> iq().
 process_search(#iq{type = get, to = To, lang = Lang} = IQ) ->
@@ -253,7 +274,7 @@ process_search(#iq{type = set, to = To, lang = Lang,
     ResultXData = search_result(Lang, To, ServerHost, Fs),
     xmpp:make_iq_result(IQ, #search{xdata = ResultXData});
 process_search(#iq{type = set, lang = Lang} = IQ) ->
-    Txt = <<"Incorrect data form">>,
+    Txt = ?T("Incorrect data form"),
     xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang)).
 
 -spec disco_items({error, stanza_error()} | {result, [disco_item()]} | empty,
@@ -262,7 +283,7 @@ process_search(#iq{type = set, lang = Lang} = IQ) ->
 disco_items(empty, _From, _To, <<"">>, _Lang) ->
     {result, []};
 disco_items(empty, _From, _To, _Node, Lang) ->
-    {error, xmpp:err_item_not_found(<<"No services available">>, Lang)};
+    {error, xmpp:err_item_not_found(?T("No services available"), Lang)};
 disco_items(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
@@ -279,17 +300,19 @@ disco_features(Acc, _From, _To, <<"">>, _Lang) ->
     {result, [?NS_DISCO_INFO, ?NS_DISCO_ITEMS,
 	      ?NS_VCARD, ?NS_SEARCH | Features]};
 disco_features(empty, _From, _To, _Node, Lang) ->
-    Txt = <<"No features available">>,
+    Txt = ?T("No features available"),
     {error, xmpp:err_item_not_found(Txt, Lang)};
 disco_features(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
 -spec disco_identity([identity()], jid(), jid(),
 		     binary(),  binary()) -> [identity()].
-disco_identity(Acc, _From, _To, <<"">>, Lang) ->
+disco_identity(Acc, _From, To, <<"">>, Lang) ->
+    Host = ejabberd_router:host_of_route(To#jid.lserver),
+    Name = get_mod_option(Host, To#jid.lserver, name),
     [#identity{category = <<"directory">>,
 	       type = <<"user">>,
-	       name = translate:translate(Lang, <<"vCard User Search">>)}|Acc];
+	       name = translate:translate(Lang, Name)}|Acc];
 disco_identity(Acc, _From, _To, _Node, _Lang) ->
     Acc.
 
@@ -377,20 +400,30 @@ make_vcard_search(User, LUser, LServer, VCARD) ->
 		  lorgunit = LOrgUnit}.
 
 -spec vcard_iq_set(iq()) -> iq() | {stop, stanza_error()}.
+vcard_iq_set(#iq{from = #jid{user = FromUser, lserver = FromLServer},
+                 to = #jid{user = ToUser, lserver = ToLServer},
+                 lang = Lang})
+  when (FromUser /= ToUser) or (FromLServer /= ToLServer) ->
+    Txt = ?T("User not allowed to perform an IQ set on another user's vCard."),
+    {stop, xmpp:err_forbidden(Txt, Lang)};
 vcard_iq_set(#iq{from = From, lang = Lang, sub_els = [VCard]} = IQ) ->
     #jid{user = User, lserver = LServer} = From,
     case set_vcard(User, LServer, VCard) of
 	{error, badarg} ->
 	    %% Should not be here?
-	    Txt = <<"Nodeprep has failed">>,
+	    Txt = ?T("Nodeprep has failed"),
 	    {stop, xmpp:err_internal_server_error(Txt, Lang)};
+	{error, not_implemented} ->
+	    Txt = ?T("Updating the vCard is not supported by the vCard storage backend"),
+	    {stop, xmpp:err_feature_not_implemented(Txt, Lang)};
 	ok ->
 	    IQ
     end;
 vcard_iq_set(Acc) ->
     Acc.
 
--spec set_vcard(binary(), binary(), xmlel() | vcard_temp()) -> {error, badarg} | ok.
+-spec set_vcard(binary(), binary(), xmlel() | vcard_temp()) ->
+    {error, badarg | not_implemented | binary()} | ok.
 set_vcard(User, LServer, VCARD) ->
     case jid:nodeprep(User) of
 	error ->
@@ -399,17 +432,21 @@ set_vcard(User, LServer, VCARD) ->
 	    VCardEl = xmpp:encode(VCARD),
 	    VCardSearch = make_vcard_search(User, LUser, LServer, VCardEl),
 	    Mod = gen_mod:db_mod(LServer, ?MODULE),
-	    Mod:set_vcard(LUser, LServer, VCardEl, VCardSearch),
-	    ets_cache:delete(?VCARD_CACHE, {LUser, LServer},
+            case Mod:set_vcard(LUser, LServer, VCardEl, VCardSearch) of
+                {atomic, ok} ->
+	            ets_cache:delete(?VCARD_CACHE, {LUser, LServer},
 			     cache_nodes(Mod, LServer)),
-	    ok
+                    ok;
+                {atomic, Error} ->
+                    {error, Error}
+            end
     end.
 
 -spec string2lower(binary()) -> binary().
 string2lower(String) ->
-    case stringprep:tolower(String) of
+    case stringprep:tolower_nofilter(String) of
       Lower when is_binary(Lower) -> Lower;
-      error -> str:to_lower(String)
+      error -> String
     end.
 
 -spec mk_tfield(binary(), binary(), binary()) -> xdata_field().
@@ -424,24 +461,33 @@ mk_field(Var, Val) ->
 
 -spec mk_search_form(jid(), binary(), binary()) -> search().
 mk_search_form(JID, ServerHost, Lang) ->
-    Title = <<(translate:translate(Lang, <<"Search users in ">>))/binary,
+    Title = <<(translate:translate(Lang, ?T("Search users in ")))/binary,
 	      (jid:encode(JID))/binary>>,
     Mod = gen_mod:db_mod(ServerHost, ?MODULE),
     SearchFields = Mod:search_fields(ServerHost),
     Fs = [mk_tfield(Label, Var, Lang) || {Label, Var} <- SearchFields],
     X = #xdata{type = form,
 	       title = Title,
-	       instructions =
-		   [translate:translate(
-		      Lang,
-		      <<"Fill in the form to search for any matching "
-			"Jabber User (Add * to the end of field "
-			"to match substring)">>)],
+	       instructions = [make_instructions(Mod, Lang)],
 	       fields = Fs},
     #search{instructions =
 		translate:translate(
-		  Lang, <<"You need an x:data capable client to search">>),
+		  Lang, ?T("You need an x:data capable client to search")),
 	    xdata = X}.
+
+-spec make_instructions(module(), binary()) -> binary().
+make_instructions(Mod, Lang) ->
+    Fill = translate:translate(
+	     Lang,
+	     ?T("Fill in the form to search for any matching "
+		"XMPP User")),
+    Add = translate:translate(
+	    Lang,
+	    ?T(" (Add * to the end of field to match substring)")),
+    case Mod of
+	mod_vcard_mnesia -> Fill;
+	_ -> str:concat(Fill, Add)
+    end.
 
 -spec search_result(binary(), jid(), binary(), [xdata_field()]) -> xdata().
 search_result(Lang, JID, ServerHost, XFields) ->
@@ -450,7 +496,7 @@ search_result(Lang, JID, ServerHost, XFields) ->
 		   {Label, Var} <- Mod:search_reported(ServerHost)],
     #xdata{type = result,
 	   title = <<(translate:translate(Lang,
-					  <<"Search Results for ">>))/binary,
+					  ?T("Search Results for ")))/binary,
 		     (jid:encode(JID))/binary>>,
 	   reported = Reported,
 	   items = lists:map(fun (Item) -> item_to_field(Item) end,
@@ -464,9 +510,8 @@ item_to_field(Items) ->
 search(LServer, XFields) ->
     Data = [{Var, Vals} || #xdata_field{var = Var, values = Vals} <- XFields],
     Mod = gen_mod:db_mod(LServer, ?MODULE),
-    AllowReturnAll = gen_mod:get_module_opt(LServer, ?MODULE, allow_return_all,
-                                            false),
-    MaxMatch = gen_mod:get_module_opt(LServer, ?MODULE, matches, ?JUD_MATCHES),
+    AllowReturnAll = mod_vcard_opt:allow_return_all(LServer),
+    MaxMatch = mod_vcard_opt:matches(LServer),
     Mod:search(LServer, Data, AllowReturnAll, MaxMatch).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -489,29 +534,17 @@ init_cache(Mod, Host, Opts) ->
     end.
 
 -spec cache_opts(binary(), gen_mod:opts()) -> [proplists:property()].
-cache_opts(Host, Opts) ->
-    MaxSize = gen_mod:get_opt(
-		cache_size, Opts,
-		ejabberd_config:cache_size(Host)),
-    CacheMissed = gen_mod:get_opt(
-		    cache_missed, Opts,
-		    ejabberd_config:cache_missed(Host)),
-    LifeTime = case gen_mod:get_opt(
-		      cache_life_time, Opts,
-		      ejabberd_config:cache_life_time(Host)) of
-		   infinity -> infinity;
-		   I -> timer:seconds(I)
-	       end,
+cache_opts(_Host, Opts) ->
+    MaxSize = mod_vcard_opt:cache_size(Opts),
+    CacheMissed = mod_vcard_opt:cache_missed(Opts),
+    LifeTime = mod_vcard_opt:cache_life_time(Opts),
     [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
 
 -spec use_cache(module(), binary()) -> boolean().
 use_cache(Mod, Host) ->
     case erlang:function_exported(Mod, use_cache, 1) of
 	true -> Mod:use_cache(Host);
-	false ->
-	    gen_mod:get_module_opt(
-	      Host, ?MODULE, use_cache,
-	      ejabberd_config:use_cache(Host))
+	false -> mod_vcard_opt:use_cache(Host)
     end.
 
 -spec cache_nodes(module(), binary()) -> [node()].
@@ -536,31 +569,228 @@ export(LServer) ->
     Mod = gen_mod:db_mod(LServer, ?MODULE),
     Mod:export(LServer).
 
+%%%
+%%% WebAdmin
+%%%
+
+webadmin_menu_hostuser(Acc, _Host, _Username, _Lang) ->
+    Acc ++ [{<<"vcard">>, <<"vCard">>}].
+
+webadmin_page_hostuser(_, Host, User,
+	      #request{path = [<<"vcard">>]} = R) ->
+    Head = ?H1GL(<<"vCard">>, <<"modules/#mod_vcard">>, <<"mod_vcard">>),
+    Set = [make_command(set_nickname, R, [{<<"user">>, User}, {<<"host">>, Host}], []),
+           make_command(set_vcard, R, [{<<"user">>, User}, {<<"host">>, Host}], []),
+           make_command(set_vcard2, R, [{<<"user">>, User}, {<<"host">>, Host}], []),
+           make_command(set_vcard2_multi, R, [{<<"user">>, User}, {<<"host">>, Host}], [])],
+    timer:sleep(100), % setting vcard takes a while, let's delay the get commands
+    FieldNames = [<<"VERSION">>, <<"FN">>, <<"NICKNAME">>, <<"BDAY">>],
+    FieldNames2 =
+        [{<<"N">>, <<"FAMILY">>},
+         {<<"N">>, <<"GIVEN">>},
+         {<<"N">>, <<"MIDDLE">>},
+         {<<"ADR">>, <<"CTRY">>},
+         {<<"ADR">>, <<"LOCALITY">>},
+         {<<"EMAIL">>, <<"USERID">>}],
+    Get = [make_command(get_vcard, R, [{<<"user">>, User}, {<<"host">>, Host}], []),
+           ?XE(<<"blockquote">>,
+               [make_table([<<"name">>, <<"value">>],
+                           [{?C(FieldName),
+                             make_command(get_vcard,
+                                          R,
+                                          [{<<"user">>, User},
+                                           {<<"host">>, Host},
+                                           {<<"name">>, FieldName}],
+                                          [{only, value}])}
+                            || FieldName <- FieldNames])]),
+           make_command(get_vcard2, R, [{<<"user">>, User}, {<<"host">>, Host}], []),
+           ?XE(<<"blockquote">>,
+               [make_table([<<"name">>, <<"subname">>, <<"value">>],
+                           [{?C(FieldName),
+                             ?C(FieldSubName),
+                             make_command(get_vcard2,
+                                          R,
+                                          [{<<"user">>, User},
+                                           {<<"host">>, Host},
+                                           {<<"name">>, FieldName},
+                                           {<<"subname">>, FieldSubName}],
+                                          [{only, value}])}
+                            || {FieldName, FieldSubName} <- FieldNames2])]),
+           make_command(get_vcard2_multi, R, [{<<"user">>, User}, {<<"host">>, Host}], [])],
+    {stop, Head ++ Get ++ Set};
+webadmin_page_hostuser(Acc, _, _, _) -> Acc.
+
+%%%
+%%% Documentation
+%%%
+
 depends(_Host, _Opts) ->
     [].
 
+-spec get_mod_option(binary(), binary(), atom()) -> any().
+get_mod_option(ServerHost, MucHost, Option) ->
+    gen_mod:get_module_option_append(ServerHost, MucHost, mod_vcard_opt, Option).
+
 mod_opt_type(allow_return_all) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
-mod_opt_type(host) -> fun iolist_to_binary/1;
-mod_opt_type(hosts) ->
-    fun (L) -> lists:map(fun iolist_to_binary/1, L) end;
-mod_opt_type(iqdisc) -> fun gen_iq_handler:check_type/1;
+    econf:bool();
+mod_opt_type(name) ->
+    econf:binary();
 mod_opt_type(matches) ->
-    fun (infinity) -> infinity;
-	(I) when is_integer(I), I > 0 -> I
-    end;
+    econf:pos_int(infinity);
 mod_opt_type(search) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(search_all_hosts) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(O) when O == cache_life_time; O == cache_size ->
-    fun (I) when is_integer(I), I > 0 -> I;
-        (infinity) -> infinity
-    end;
-mod_opt_type(O) when O == use_cache; O == cache_missed ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(_) ->
-    [allow_return_all, db_type, host, hosts, iqdisc, matches,
-     search, search_all_hosts, cache_life_time, cache_size,
-     use_cache, cache_missed].
+    econf:bool();
+mod_opt_type(host) ->
+    econf:host();
+mod_opt_type(hosts) ->
+    econf:hosts();
+mod_opt_type(append_module_config) ->
+    econf:and_then(
+        econf:map(econf:domain(), econf:list(econf:any())),
+      econf:map(
+        econf:domain(),
+        ejabberd_options:validator(?MODULE, [append_module_config]),
+        [unique]));
+mod_opt_type(db_type) ->
+    econf:db_type(?MODULE);
+mod_opt_type(use_cache) ->
+    econf:bool();
+mod_opt_type(cache_size) ->
+    econf:pos_int(infinity);
+mod_opt_type(cache_missed) ->
+    econf:bool();
+mod_opt_type(cache_life_time) ->
+    econf:timeout(second, infinity);
+mod_opt_type(vcard) ->
+    econf:vcard_temp().
+
+-spec mod_options(binary()) -> [{append_module_config, [{binary(), any()}]} |
+                                {atom(), any()}].
+mod_options(Host) ->
+    [{allow_return_all, false},
+     {host, <<"vjud.", Host/binary>>},
+     {hosts, []},
+     {append_module_config, []},
+     {matches, 30},
+     {search, false},
+     {name, ?T("vCard User Search")},
+     {vcard, undefined},
+     {db_type, ejabberd_config:default_db(Host, ?MODULE)},
+     {use_cache, ejabberd_option:use_cache(Host)},
+     {cache_size, ejabberd_option:cache_size(Host)},
+     {cache_missed, ejabberd_option:cache_missed(Host)},
+     {cache_life_time, ejabberd_option:cache_life_time(Host)}].
+
+mod_doc() ->
+    #{desc =>
+          ?T("This module allows end users to store and retrieve "
+             "their vCard, and to retrieve other users vCards, "
+             "as defined in https://xmpp.org/extensions/xep-0054.html"
+             "[XEP-0054: vcard-temp]. The module also implements an "
+             "uncomplicated Jabber User Directory based on the vCards "
+             "of these users. Moreover, it enables the server to send "
+             "its vCard when queried."),
+      opts =>
+          [{allow_return_all,
+            #{value => "true | false",
+              desc =>
+                  ?T("This option enables you to specify if search "
+                     "operations with empty input fields should return "
+                     "all users who added some information to their vCard. "
+                     "The default value is 'false'.")}},
+           {host,
+            #{desc => ?T("Deprecated. Use 'hosts' instead.")}},
+           {hosts,
+            #{value => ?T("[Host, ...]"),
+              desc =>
+                  ?T("This option defines the Jabber IDs of the service. "
+                     "If the 'hosts' option is not specified, the only Jabber ID will "
+                     "be the hostname of the virtual host with the prefix '\"vjud.\"'. "
+                     "The keyword '@HOST@' is replaced with the real virtual host name.")}},
+           {append_module_config,
+            #{value => "{VcardHost: Options}",
+              note => "added in 26.07",
+              desc =>
+                  ?T("Add a few specific options to a certain upload host "
+                     "previously defined in the mod_vcard 'hosts' option. "
+                     "Right now only 'name' can be defined here. "
+                     "This is similar to the toplevel _`append_host_config`_ option, "
+                     "but in this case it's applied to this module options."),
+              example =>
+                  ["modules:",
+                   "  mod_vcard:",
+                   "    hosts:",
+                   "      - service1.@HOST@",
+                   "      - service2.@HOST@",
+                   "    name: \"Service General\"",
+                   "    append_module_config:",
+                   "      service1.localhost:",
+                   "        name: \"Service 1\"",
+                   "      service2.example.net:",
+                   "        name: \"Service 2\""]}},
+           {name,
+            #{value => ?T("Name"),
+              desc =>
+                  ?T("The value of the service name. This name is only visible in some "
+                     "clients that support https://xmpp.org/extensions/xep-0030.html"
+                     "[XEP-0030: Service Discovery]. The default is 'vCard User Search'.")}},
+           {matches,
+            #{value => "pos_integer() | infinity",
+              desc =>
+                  ?T("With this option, the number of reported search results "
+                     "can be limited. If the option's value is set to 'infinity', "
+                     "all search results are reported. The default value is '30'.")}},
+           {search,
+            #{value => "true | false",
+              desc =>
+                  ?T("This option specifies whether the search functionality "
+                     "is enabled or not. If disabled, the options 'hosts', 'name' "
+                     "and 'vcard' will be ignored and the Jabber User Directory "
+                     "service will not appear in the Service Discovery item list. "
+                     "The default value is 'false'.")}},
+           {db_type,
+            #{value => "mnesia | sql | ldap",
+              desc =>
+                  ?T("Same as top-level _`default_db`_ option, but applied to this module only.")}},
+           {use_cache,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level _`use_cache`_ option, but applied to this module only.")}},
+           {cache_size,
+            #{value => "pos_integer() | infinity",
+              desc =>
+                  ?T("Same as top-level _`cache_size`_ option, but applied to this module only.")}},
+           {cache_missed,
+            #{value => "true | false",
+              desc =>
+                  ?T("Same as top-level _`cache_missed`_ option, but applied to this module only.")}},
+           {cache_life_time,
+            #{value => "timeout()",
+              desc =>
+                  ?T("Same as top-level _`cache_life_time`_ option, but applied to this module only.")}},
+           {vcard,
+            #{value => ?T("vCard"),
+              desc =>
+                  ?T("A custom vCard of the server that will be displayed "
+                     "by some XMPP clients in Service Discovery. The value of "
+                     "'vCard' is a YAML map constructed from an XML representation "
+                     "of vCard. Since the representation has no attributes, "
+                     "the mapping is straightforward."),
+              example =>
+                  ["# This XML representation of vCard:",
+                   "# ",
+                   "#   <vCard xmlns='vcard-temp'>",
+                   "#     <FN>Conferences</FN>",
+                   "#     <ADR>",
+                   "#       <WORK/>",
+                   "#       <STREET>Elm Street</STREET>",
+                   "#     </ADR>",
+                   "#   </vCard>",
+                   "# ",
+                   "# is translated to:",
+                   "# ",
+                   "vcard:",
+                   "  fn: Conferences",
+                   "  adr:",
+                   "    -",
+                   "      work: true",
+                   "      street: Elm Street"]}}]}.

@@ -4,7 +4,7 @@
 %%% Created : 14 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -24,7 +24,6 @@
 
 -module(mod_shared_roster_sql).
 
--compile([{parse_transform, ejabberd_sql_pt}]).
 
 -behaviour(mod_shared_roster).
 
@@ -35,8 +34,9 @@
 	 get_user_displayed_groups/3, is_user_in_group/3,
 	 add_user_to_group/3, remove_user_from_group/3, import/3,
 	 export/1]).
+-export([sql_schemas/0]).
 
--include("jid.hrl").
+-include_lib("xmpp/include/jid.hrl").
 -include("mod_roster.hrl").
 -include("mod_shared_roster.hrl").
 -include("ejabberd_sql_pt.hrl").
@@ -44,13 +44,44 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-init(_Host, _Opts) ->
+init(Host, _Opts) ->
+    ejabberd_sql_schema:update_schema(Host, ?MODULE, sql_schemas()),
     ok.
+
+sql_schemas() ->
+    [#sql_schema{
+        version = 1,
+        tables =
+            [#sql_table{
+                name = <<"sr_group">>,
+                columns =
+                    [#sql_column{name = <<"name">>, type = text},
+                     #sql_column{name = <<"server_host">>, type = text},
+                     #sql_column{name = <<"opts">>, type = text},
+                     #sql_column{name = <<"created_at">>, type = timestamp,
+                                 default = true}],
+                indices = [#sql_index{
+                              columns = [<<"server_host">>, <<"name">>],
+                              unique = true}]},
+             #sql_table{
+                name = <<"sr_user">>,
+                columns =
+                    [#sql_column{name = <<"jid">>, type = text},
+                     #sql_column{name = <<"server_host">>, type = text},
+                     #sql_column{name = <<"grp">>, type = text},
+                     #sql_column{name = <<"created_at">>, type = timestamp,
+                                 default = true}],
+                indices = [#sql_index{
+                              columns = [<<"server_host">>,
+                                         <<"jid">>, <<"grp">>],
+                              unique = true},
+                           #sql_index{
+                              columns = [<<"server_host">>, <<"grp">>]}]}]}].
 
 list_groups(Host) ->
     case ejabberd_sql:sql_query(
 	   Host,
-           ?SQL("select @(name)s from sr_group")) of
+           ?SQL("select @(name)s from sr_group where %(Host)H")) of
 	{selected, Rs} -> [G || {G} <- Rs];
 	_ -> []
     end.
@@ -58,7 +89,7 @@ list_groups(Host) ->
 groups_with_opts(Host) ->
     case ejabberd_sql:sql_query(
            Host,
-           ?SQL("select @(name)s, @(opts)s from sr_group"))
+           ?SQL("select @(name)s, @(opts)s from sr_group where %(Host)H"))
 	of
       {selected, Rs} ->
 	  [{G, mod_shared_roster:opts_to_binary(ejabberd_sql:decode_term(Opts))}
@@ -72,6 +103,7 @@ create_group(Host, Group, Opts) ->
 		?SQL_UPSERT_T(
                    "sr_group",
                    ["!name=%(Group)s",
+                    "!server_host=%(Host)s",
                     "opts=%(SOpts)s"])
 	end,
     ejabberd_sql:sql_transaction(Host, F).
@@ -79,9 +111,9 @@ create_group(Host, Group, Opts) ->
 delete_group(Host, Group) ->
     F = fun () ->
 		ejabberd_sql:sql_query_t(
-                  ?SQL("delete from sr_group where name=%(Group)s")),
+                  ?SQL("delete from sr_group where name=%(Group)s and %(Host)H")),
 		ejabberd_sql:sql_query_t(
-                  ?SQL("delete from sr_user where grp=%(Group)s"))
+                  ?SQL("delete from sr_user where grp=%(Group)s and %(Host)H"))
 	end,
     case ejabberd_sql:sql_transaction(Host, F) of
         {atomic,{updated,_}} -> {atomic, ok};
@@ -91,9 +123,10 @@ delete_group(Host, Group) ->
 get_group_opts(Host, Group) ->
     case catch ejabberd_sql:sql_query(
 		 Host,
-		 ?SQL("select @(opts)s from sr_group where name=%(Group)s")) of
+		 ?SQL("select @(opts)s from sr_group"
+                      " where name=%(Group)s and %(Host)H")) of
 	{selected, [{SOpts}]} ->
-	    mod_shared_roster:opts_to_binary(ejabberd_sql:decode_term(SOpts));
+            {ok, mod_shared_roster:opts_to_binary(ejabberd_sql:decode_term(SOpts))};
 	_ -> error
     end.
 
@@ -103,6 +136,7 @@ set_group_opts(Host, Group, Opts) ->
 		?SQL_UPSERT_T(
                    "sr_group",
                    ["!name=%(Group)s",
+                    "!server_host=%(Host)s",
                     "opts=%(SOpts)s"])
 	end,
     ejabberd_sql:sql_transaction(Host, F).
@@ -111,7 +145,8 @@ get_user_groups(US, Host) ->
     SJID = make_jid_s(US),
     case catch ejabberd_sql:sql_query(
 		 Host,
-		 ?SQL("select @(grp)s from sr_user where jid=%(SJID)s")) of
+		 ?SQL("select @(grp)s from sr_user"
+                      " where jid=%(SJID)s and %(Host)H")) of
 	{selected, Rs} -> [G || {G} <- Rs];
 	_ -> []
     end.
@@ -119,7 +154,8 @@ get_user_groups(US, Host) ->
 get_group_explicit_users(Host, Group) ->
     case catch ejabberd_sql:sql_query(
 		 Host,
-		 ?SQL("select @(jid)s from sr_user where grp=%(Group)s")) of
+		 ?SQL("select @(jid)s from sr_user"
+                      " where grp=%(Group)s and %(Host)H")) of
 	{selected, Rs} ->
 	    lists:map(
 	      fun({JID}) ->
@@ -134,7 +170,8 @@ get_user_displayed_groups(LUser, LServer, GroupsOpts) ->
     SJID = make_jid_s(LUser, LServer),
     case catch ejabberd_sql:sql_query(
 		 LServer,
-		 ?SQL("select @(grp)s from sr_user where jid=%(SJID)s")) of
+		 ?SQL("select @(grp)s from sr_user"
+                      " where jid=%(SJID)s and %(LServer)H")) of
 	{selected, Rs} ->
 	    [{Group, proplists:get_value(Group, GroupsOpts, [])}
 	     || {Group} <- Rs];
@@ -146,7 +183,7 @@ is_user_in_group(US, Group, Host) ->
     case catch ejabberd_sql:sql_query(
                  Host,
                  ?SQL("select @(jid)s from sr_user where jid=%(SJID)s"
-                      " and grp=%(Group)s")) of
+                      " and %(Host)H and grp=%(Group)s")) of
 	{selected, []} -> false;
 	_ -> true
     end.
@@ -155,15 +192,18 @@ add_user_to_group(Host, US, Group) ->
     SJID = make_jid_s(US),
     ejabberd_sql:sql_query(
       Host,
-      ?SQL("insert into sr_user(jid, grp) values ("
-           "%(SJID)s, %(Group)s)")).
+      ?SQL_INSERT(
+         "sr_user",
+         ["jid=%(SJID)s",
+          "server_host=%(Host)s",
+          "grp=%(Group)s"])).
 
 remove_user_from_group(Host, US, Group) ->
     SJID = make_jid_s(US),
     F = fun () ->
 		ejabberd_sql:sql_query_t(
-                  ?SQL("delete from sr_user where jid=%(SJID)s and"
-                       " grp=%(Group)s")),
+                  ?SQL("delete from sr_user where jid=%(SJID)s and %(Host)H"
+                       " and grp=%(Group)s")),
 		ok
 	end,
     ejabberd_sql:sql_transaction(Host, F).
@@ -173,9 +213,12 @@ export(_Server) ->
       fun(Host, #sr_group{group_host = {Group, LServer}, opts = Opts})
             when LServer == Host ->
               SOpts = misc:term_to_expr(Opts),
-              [?SQL("delete from sr_group where name=%(Group)s;"),
-               ?SQL("insert into sr_group(name, opts) values ("
-                    "%(Group)s, %(SOpts)s);")];
+              [?SQL("delete from sr_group where name=%(Group)s and %(Host)H;"),
+               ?SQL_INSERT(
+                  "sr_group",
+                  ["name=%(Group)s",
+                   "server_host=%(Host)s",
+                   "opts=%(SOpts)s"])];
          (_Host, _R) ->
               []
       end},
@@ -183,10 +226,13 @@ export(_Server) ->
       fun(Host, #sr_user{us = {U, S}, group_host = {Group, LServer}})
             when LServer == Host ->
               SJID = make_jid_s(U, S),
-              [?SQL("select @(jid)s from sr_user where jid=%(SJID)s"
-                    " and grp=%(Group)s;"),
-               ?SQL("insert into sr_user(jid, grp) values ("
-                    "%(SJID)s, %(Group)s);")];
+              [?SQL("delete from sr_user where jid=%(SJID)s"
+                    " and %(Host)H and grp=%(Group)s;"),
+               ?SQL_INSERT(
+                  "sr_user",
+                  ["jid=%(SJID)s",
+                   "server_host=%(Host)s",
+                   "grp=%(Group)s"])];
          (_Host, _R) ->
               []
       end}].

@@ -4,7 +4,7 @@
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,17 +25,23 @@
 -module(mod_roster_mnesia).
 
 -behaviour(mod_roster).
+-behaviour(ejabberd_db_serialize).
 
 %% API
 -export([init/2, read_roster_version/2, write_roster_version/4,
 	 get_roster/2, get_roster_item/3, roster_subscribe/4,
 	 remove_user/2, update_roster/4, del_roster/3, transaction/2,
 	 read_subscription_and_groups/3, import/3, create_roster/1,
+	 process_rosteritems/5,
 	 use_cache/2]).
 -export([need_transform/1, transform/1]).
+-export([serialize/3, deserialize_start/1, deserialize/2]).
 
 -include("mod_roster.hrl").
 -include("logger.hrl").
+-include("ejabberd_db_serialize.hrl").
+-include_lib("xmpp/include/xmpp.hrl").
+-include_lib("stdlib/include/ms_transform.hrl").
 
 %%%===================================================================
 %%% API
@@ -53,9 +59,7 @@ init(_Host, _Opts) ->
 use_cache(Host, Table) ->
     case mnesia:table_info(Table, storage_type) of
 	disc_only_copies ->
-	    gen_mod:get_module_opt(
-	      Host, mod_roster, use_cache,
-	      ejabberd_config:use_cache(Host));
+	    mod_roster_opt:use_cache(Host);
 	_ ->
 	    false
     end.
@@ -104,8 +108,8 @@ del_roster(LUser, LServer, LJID) ->
 
 read_subscription_and_groups(LUser, LServer, LJID) ->
     case mnesia:dirty_read(roster, {LUser, LServer, LJID}) of
-	[#roster{subscription = Subscription, groups = Groups}] ->
-	    {ok, {Subscription, Groups}};
+	[#roster{subscription = Subscription, ask = Ask, groups = Groups}] ->
+	    {ok, {Subscription, Ask, Groups}};
 	_ ->
 	    error
     end.
@@ -122,24 +126,34 @@ import(LServer, <<"roster_version">>, [LUser, Ver]) ->
     RV = #roster_version{us = {LUser, LServer}, version = Ver},
     mnesia:dirty_write(RV).
 
-need_transform(#roster{usj = {U, S, _}}) when is_list(U) orelse is_list(S) ->
+need_transform({roster, {U, S, _}, _, _, _, _, _, _, _, _})
+  when is_list(U) orelse is_list(S) ->
     ?INFO_MSG("Mnesia table 'roster' will be converted to binary", []),
     true;
-need_transform(#roster_version{us = {U, S}, version = Ver})
+need_transform({roster_version, {U, S}, Ver})
   when is_list(U) orelse is_list(S) orelse is_list(Ver) ->
     ?INFO_MSG("Mnesia table 'roster_version' will be converted to binary", []),
+    true;
+need_transform({roster, {_, _, _}, _, _, _, _, none, _, _, _, _}) ->
+    ?INFO_MSG("Mnesia table 'roster' will be converted to use new boolean() 'approved' attribute.", []),
     true;
 need_transform(_) ->
     false.
 
-transform(#roster{usj = {U, S, {LU, LS, LR}},
-		  us = {U1, S1},
-		  jid = {U2, S2, R2},
-		  name = Name,
-		  groups = Gs,
-		  askmessage = Ask,
-		  xs = Xs} = R) ->
-    R#roster{usj = {iolist_to_binary(U), iolist_to_binary(S),
+transform({roster, USJ, US, Jid, Name, Sub, none, Ask, Groups, AskMsg, XS}) ->
+    #roster{
+       us = US,
+       usj = USJ,
+       jid = Jid,
+       name = Name,
+       subscription = Sub,
+       approved = false,
+       ask = Ask,
+       groups = Groups,
+       askmessage = AskMsg,
+       xs = XS};
+transform({roster, {U, S, {LU, LS, LR}}, {U1, S1}, {U2, S2, R2}, Name, Sub, Ask, Gs, AskMsg, Xs}) ->
+    #roster{usj = {iolist_to_binary(U), iolist_to_binary(S),
 		    {iolist_to_binary(LU),
 		     iolist_to_binary(LS),
 		     iolist_to_binary(LR)}},
@@ -148,13 +162,217 @@ transform(#roster{usj = {U, S, {LU, LS, LR}},
 		    iolist_to_binary(S2),
 		    iolist_to_binary(R2)},
 	     name = iolist_to_binary(Name),
+         subscription = Sub,
+         ask = Ask,
 	     groups = [iolist_to_binary(G) || G <- Gs],
-	     askmessage = try iolist_to_binary(Ask)
+	     askmessage = try iolist_to_binary(AskMsg)
 			  catch _:_ -> <<"">> end,
 	     xs = [fxml:to_xmlel(X) || X <- Xs]};
 transform(#roster_version{us = {U, S}, version = Ver} = R) ->
     R#roster_version{us = {iolist_to_binary(U), iolist_to_binary(S)},
 		     version = iolist_to_binary(Ver)}.
+
+%%%===================================================================
+
+process_rosteritems(ActionS, SubsS, AsksS, UsersS, ContactsS) ->
+    Action = case ActionS of
+                 "list" -> list;
+                 "delete" -> delete
+             end,
+    Subs = lists:foldl(
+             fun(any, _) -> [none, from, to, both];
+                (Sub, Subs) -> [Sub | Subs]
+             end,
+             [],
+             [list_to_existing_atom(S) || S <- string:tokens(SubsS, ":")]
+            ),
+    Asks = lists:foldl(
+             fun(any, _) -> [none, out, in];
+                (Ask, Asks) -> [Ask | Asks]
+             end,
+             [],
+             [list_to_existing_atom(S) || S <- string:tokens(AsksS, ":")]
+            ),
+    Users = lists:foldl(
+              fun("any", _) -> ["*", "*@*"];
+                 (U, Us) -> [U | Us]
+              end,
+              [],
+              [S || S <- string:tokens(UsersS, ":")]
+             ),
+    Contacts = lists:foldl(
+                 fun("any", _) -> ["*", "*@*"];
+                    (U, Us) -> [U | Us]
+                 end,
+                 [],
+                 [S || S <- string:tokens(ContactsS, ":")]
+                ),
+    rosteritem_purge({Action, Subs, Asks, Users, Contacts}).
+
+rosteritem_purge(Options) ->
+    Num_rosteritems = mnesia:table_info(roster, size),
+    io:format("There are ~p roster items in total.~n", [Num_rosteritems]),
+    Key = mnesia:dirty_first(roster),
+    rip(Key, Options, {0, Num_rosteritems, 0, 0}, []).
+
+rip('$end_of_table', _Options, Counters, Res) ->
+    print_progress_line(Counters),
+    Res;
+rip(Key, Options, {Pr, NT, NV, ND}, Res) ->
+    Key_next = mnesia:dirty_next(roster, Key),
+    {Action, _, _, _, _} = Options,
+    {ND2, Res2} = case decide_rip(Key, Options) of
+              true ->
+                  Jids = apply_action(Action, Key),
+                  {ND+1, [Jids | Res]};
+              false ->
+                  {ND, Res}
+          end,
+    NV2 = NV+1,
+    Pr2 = print_progress_line({Pr, NT, NV2, ND2}),
+    rip(Key_next, Options, {Pr2, NT, NV2, ND2}, Res2).
+
+apply_action(list, Key) ->
+    {User, Server, JID} = Key,
+    {RUser, RServer, _} = JID,
+    Jid1string = <<User/binary, "@", Server/binary>>,
+    Jid2string = <<RUser/binary, "@", RServer/binary>>,
+    io:format("Matches: ~ts ~ts~n", [Jid1string, Jid2string]),
+    {Jid1string, Jid2string};
+apply_action(delete, Key) ->
+    R = apply_action(list, Key),
+    mnesia:dirty_delete(roster, Key),
+    R.
+
+print_progress_line({_Pr, 0, _NV, _ND}) ->
+    ok;
+print_progress_line({Pr, NT, NV, ND}) ->
+    Pr2 = trunc((NV/NT)*100),
+    case Pr == Pr2 of
+        true ->
+            ok;
+        false ->
+            io:format("Progress ~p% - visited ~p - deleted ~p~n", [Pr2, NV, ND])
+    end,
+    Pr2.
+
+decide_rip(Key, {_Action, Subs, Asks, User, Contact}) ->
+    case catch mnesia:dirty_read(roster, Key) of
+        [RI] ->
+            lists:member(RI#roster.subscription, Subs)
+                andalso lists:member(RI#roster.ask, Asks)
+                andalso decide_rip_jid(RI#roster.us, User)
+                andalso decide_rip_jid(RI#roster.jid, Contact);
+        _ ->
+            false
+    end.
+
+%% Returns true if the server of the JID is included in the servers
+decide_rip_jid({UName, UServer, _UResource}, Match_list) ->
+    decide_rip_jid({UName, UServer}, Match_list);
+decide_rip_jid({UName, UServer}, Match_list) ->
+    lists:any(
+      fun(Match_string) ->
+              MJID = jid:decode(list_to_binary(Match_string)),
+              MName = MJID#jid.luser,
+              MServer = MJID#jid.lserver,
+              Is_server = is_glob_match(UServer, MServer),
+              case MName of
+                  <<>> when UName == <<>> ->
+                      Is_server;
+                  <<>> ->
+                      false;
+                  _ ->
+                      Is_server
+                          andalso is_glob_match(UName, MName)
+              end
+      end,
+      Match_list).
+
+%% Copied from ejabberd-2.0.0/src/acl.erl
+is_regexp_match(String, RegExp) ->
+    case ejabberd_regexp:run(String, RegExp) of
+        nomatch ->
+            false;
+        match ->
+            true;
+        {error, ErrDesc} ->
+            io:format(
+              "Wrong regexp ~p in ACL: ~p",
+              [RegExp, ErrDesc]),
+            false
+    end.
+is_glob_match(String, <<"!", Glob/binary>>) ->
+    not is_regexp_match(String, ejabberd_regexp:sh_to_awk(Glob));
+is_glob_match(String, Glob) ->
+    is_regexp_match(String, ejabberd_regexp:sh_to_awk(Glob)).
+
+serialize(LServer, BatchSize, undefined) ->
+    Users = lists:uniq(lists:sort(mnesia:dirty_select(roster, ets:fun2ms(
+	fun(#roster{us = {U, S}}) when S == LServer -> U end)))),
+    ReadRoster =
+	fun(U) ->
+	    Roster = mnesia:dirty_index_read(roster, {U, LServer}, #roster.us),
+	    Entries = [{jid:encode(Jid), Name, Groups, Sub, Ask, AskMsg, Approved} ||
+			  #roster{jid = Jid, name = Name, groups = Groups, ask = Ask,
+				  subscription = Sub, askmessage = AskMsg, approved = Approved} <- Roster],
+	    case mnesia:dirty_read(roster_version, {U, LServer}) of
+		[] ->
+		    {ok, #serialize_roster_v2{username = U, serverhost = LServer, entries = Entries}};
+		[#roster_version{version = V} | _] ->
+		    {ok, #serialize_roster_v2{username = U, serverhost = LServer, entries = Entries, version = V}}
+	    end
+	end,
+
+    ejabberd_db_serialize:iter_records(
+	[{
+	     fun() ->
+		 case Users of
+		     [H | T] -> {ok, H, T};
+		     _ -> fin
+		 end
+	     end,
+	     fun([]) -> fin;
+		([H | T]) -> {ok, H, T}
+	     end, ReadRoster}], [], BatchSize);
+serialize(_LServer, BatchSize, Key) ->
+    ejabberd_db_serialize:iter_records(Key, [], BatchSize).
+
+deserialize_start(LServer) ->
+    mnesia:transaction(
+	fun() ->
+	    Keys = mnesia:select(roster,
+				 ets:fun2ms(
+				     fun(#roster{us = {_, S}, usj = USJ}) when S == LServer -> USJ end)),
+	    lists:foreach(fun(Key) -> mnesia:delete(roster, Key, write) end, Keys)
+	end),
+    ok.
+
+deserialize(LServer, Batch) ->
+    F = fun() ->
+	lists:foreach(
+	    fun(#serialize_roster_v2{username = User, entries = Entries, version = Version}) ->
+		US = {User, LServer},
+		lists:foreach(
+		    fun({Jid, Name, Groups, Sub, Ask, AskMsg, Approved}) ->
+			J = jid:tolower(jid:decode(Jid)),
+			mnesia:write(#roster{us = US, usj = {User, LServer, J}, jid = J, name = Name,
+					     groups = Groups, subscription = Sub, ask = Ask, askmessage = AskMsg,
+					     approved = Approved})
+		    end, Entries),
+		case Version of
+		    undefined -> ok;
+		    _ ->
+			mnesia:write(#roster_version{us = US, version = Version})
+		end
+	    end, Batch)
+	end,
+    case mnesia:transaction(F) of
+	{atomic, _} ->
+	    ok;
+	{aborted, Reason} ->
+	    {error, io_lib:format("Error when writing roster data: ~p", [Reason])}
+    end.
 
 %%%===================================================================
 %%% Internal functions

@@ -1,0 +1,526 @@
+%%%----------------------------------------------------------------------
+%%% File    : ejabberd_db_serialize.erl
+%%% Author  : Pawel Chmielowski <pawel@process-one.net>
+%%% Purpose : DB data de/serialization
+%%% Created : 20 Nov 2025 by Pawel Chmielowski <pawel@process-one.net>
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+-module(ejabberd_db_serialize).
+
+-include("ejabberd_db_serialize.hrl").
+
+%% API
+-export([export/2, export/4,
+         export_status/1,
+         export_abort/1,
+         import/2, import/3,
+         import_status/1,
+         import_abort/1]).
+-export([iter_records/3, fmt/2, mnesia_iter/2, to_json/1]).
+
+
+-callback serialize(binary(), non_neg_integer(), undefined | term()) ->
+              {ok, [term()], term()} | {error, iolist()}.
+-callback deserialize_start(binary()) -> ok | {error, iolist()}.
+-callback deserialize(binary(), [term()]) -> ok | {error, iolist()}.
+
+-define(BATCH_SIZE, 1000).
+
+export(Host, Dir) ->
+    export(Host, Dir, undefined, dbser).
+
+
+export(Host, Dir, Mods, json) ->
+    F = fun(IO, Data) ->
+                lists:foldl(
+                  fun(_Rec, {error, _} = Acc) ->
+                          Acc;
+                     (Rec, _) ->
+                          Ser = to_json(Rec),
+                          try
+                              io:fwrite(IO, "~s~n~n", [Ser])
+                          catch
+                              _:_ ->
+                                  {error, <<"Error durring write">>}
+                          end
+                  end,
+                  ok,
+                  Data)
+        end,
+    export(Host, Dir, Mods, F, <<"json">>);
+export(Host, Dir, Mods, dbser) ->
+    F = fun(IO, Data) ->
+                Ser = term_to_binary(Data),
+                SerLen = byte_size(Ser),
+                maybe
+                    ok ?= file:write(IO, <<"dbdb", SerLen:32/unsigned-little-integer>>),
+                    ok ?= file:write(IO, Ser)
+                else
+                    {error, Msg} ->
+                        {error, Msg}
+                end
+        end,
+    export(Host, Dir, Mods, F, <<"dbser">>).
+
+
+export(Host0, Dir, undefined, WriteFun, Ext) ->
+    Host = jid:nameprep(Host0),
+    export(Host, Dir, [ejabberd_auth | gen_mod:loaded_modules(Host)], WriteFun, Ext);
+export(Host0, Dir, Mods, WriteFun, Ext) ->
+    Host = jid:nameprep(Host0),
+    ModsF = compatible_mods(Host, fun module_can_serialize/3, Mods),
+    F = fun Job({[], _State}) ->
+                MM = lists:map(fun({M, _}) -> atom_to_binary(M, latin1) end, ModsF),
+                {ok, undefined,
+                     0,
+                     fmt(<<"Serialization finished for modules: ~s">>,
+                         [lists:join(<<", ">>, MM)])};
+            Job({[{Mod2, DbMod2} | Rest] = Mods2, Key}) ->
+                case write_batch(WriteFun, Ext, Host, Mod2, DbMod2, Dir, Key) of
+                    {ok, undefined, _Count} ->
+                        Job({Rest, undefined});
+                    {ok, NextKey, Count} ->
+                        {ok, {Mods2, NextKey},
+                             Count,
+                             <<"Serializing ", (atom_to_binary(Mod2))/binary>>};
+                    {error, _} = E ->
+                        E
+                end
+        end,
+    case ejabberd_batch:register_task({db_export, Host},
+                                      0,
+                                      infinity,
+                                      {ModsF, undefined},
+                                      F) of
+        ok ->
+            {ok, <<"Export started">>};
+        {error, in_progress} ->
+            {error, <<"Operation in progress">>}
+    end.
+
+
+to_json(#serialize_auth_v1{passwords = Passwords} = Data) ->
+    Passwords2 = lists:map(
+        fun({Type, StoredKey, ServerKey, Salt, IterCount}) ->
+            #{type => atom_to_binary(Type, latin1),
+              stored_key => StoredKey,
+              server_key => ServerKey,
+              salt => Salt,
+              iter_count => IterCount};
+           (Val) when is_binary(Val) -> Val
+        end, Passwords),
+    to_json(tuple_to_list(Data#serialize_auth_v1{passwords = Passwords2}), [type | record_info(fields, serialize_auth_v1)], #{});
+to_json(#serialize_mam_prefs_v1{} = Data) ->
+    to_json(tuple_to_list(Data), [type | record_info(fields, serialize_mam_prefs_v1)], #{});
+to_json(#serialize_mam_v1{} = Data) ->
+    to_json(tuple_to_list(Data), [type | record_info(fields, serialize_mam_v1)], #{});
+to_json(#serialize_muc_registrations_v1{} = Data) ->
+    to_json(tuple_to_list(Data), [type | record_info(fields, serialize_muc_registrations_v1)], #{});
+to_json(#serialize_muc_room_v1{options = Options} = Data) ->
+    Options2 = lists:foldl(
+                 fun({affiliations, Aff}, Acc) ->
+                         Aff2 = [ #{jid => jid:encode(J), type => Type, msg => Msg} || {J, {Type, Msg}} <- Aff ],
+                         Acc#{affiliatons => Aff2};
+                    ({subject, Subs}, Acc) when Subs /= [] ->
+                         Acc#{subjects => [#{lang => Lang, text => Sub} || {text, Lang, Sub} <- Subs]};
+                    ({subject_author, {Nick, J}}, Acc) ->
+                         Acc#{subject_author => #{author => jid:encode(J), nick => Nick}};
+                    ({subscribers, Subs}, Acc) ->
+                         Subs2 = [ #{jid => jid:encode(J), nick => Nick, events => Events} || {J, Nick, Events} <- Subs ],
+                         Acc#{subscribers => Subs2};
+                    ({K, V}, Acc) ->
+                         Acc#{K => V}
+                 end,
+                 #{},
+                 Options),
+    Data2 = setelement(#serialize_muc_room_v1.options, Data, Options2),
+    to_json(tuple_to_list(Data2), [type | record_info(fields, serialize_muc_room_v1)], #{});
+to_json(#serialize_roster_v1{entries = Entries} = Data) ->
+    Entries2 = lists:map(fun({Jid, Nick, Groups, Sub, Ask, AskMsg}) ->
+                                 #{jid => Jid, nick => Nick, groups => Groups, sub => Sub, ask => Ask, ask_msg => AskMsg}
+                         end,
+                         Entries),
+    Data2 = setelement(#serialize_roster_v1.entries, Data, Entries2),
+    to_json(tuple_to_list(Data2), [type | record_info(fields, serialize_roster_v1)], #{});
+to_json(#serialize_roster_v2{entries = Entries} = Data) ->
+    Entries2 = lists:map(fun({Jid, Nick, Groups, Sub, Ask, AskMsg, Approved}) ->
+        #{jid => Jid, nick => Nick, groups => Groups, sub => Sub, ask => Ask, ask_msg => AskMsg, approved => Approved}
+                         end,
+                         Entries),
+    Data2 = setelement(#serialize_roster_v1.entries, Data, Entries2),
+    to_json(tuple_to_list(Data2), [type | record_info(fields, serialize_roster_v1)], #{});
+to_json(#serialize_privacy_v1{lists = Lists} = Data) ->
+    Lists2 = lists:map(
+        fun({Name, Entries}) ->
+            Entries2 = lists:map(
+                fun({Value, Action, Order, MA, MI, MM, MPI, MPO}) ->
+                    Value2 = case Value of
+                                 V when is_atom(V) -> atom_to_binary(V, utf8);
+                                 V -> V
+                             end,
+                    #{value => Value2, action => atom_to_binary(Action, utf8), order => Order,
+                      match_all => MA, match_iq => MI, match_message => MM,
+                      match_presence_in => MPI, match_presence_out => MPO}
+                end, Entries),
+            #{list_name => Name, entries => Entries2}
+        end, Lists),
+Data2 = setelement(#serialize_privacy_v1.lists, Data, Lists2),
+    to_json(tuple_to_list(Data2), [type | record_info(fields, serialize_privacy_v1)], #{});
+to_json(#serialize_pubsub_item_v1{id = Id, created = {CTs, CJid}, modified = {MTs, MJid}, xml = Xml}) ->
+    #{id => Id, created_ts => CTs, created_by => CJid, modified_ts => MTs, modified_by => MJid, payload => Xml};
+to_json(#serialize_pubsub_state_v1{jid = Jid, items = Items, affiliation = Affiliation, subscriptions = Subscriptions}) ->
+    Subs = [to_json(S) || S <- Subscriptions],
+    #{jid => Jid, items => Items, affiliation => atom_to_binary(Affiliation), subscriptions => Subs};
+to_json(#serialize_pubsub_subscription_v1{subid = SubId, subscription = Subscription, options = Options}) ->
+    Options2 = tl_to_json(Options, #{}),
+    #{id => SubId, subscription => atom_to_binary(Subscription), options => Options2};
+to_json(#serialize_pubsub_v1{jid = Jid, node = Node, items = Items, options = Options, parents = Parents,
+                             plugin = Plugin, states = States}) ->
+    Items2 = [to_json(I) || I <- Items],
+    States2 = [to_json(S) || S <- States],
+    Options2 = tl_to_json(Options, #{}),
+    misc:json_encode(
+        #{type => <<"serialize_pubsub_v1">>, jid => Jid, node => Node, items => Items2, parents => Parents, plugin => Plugin,
+          states => States2, options => Options2}).
+
+tl_to_json([], Acc) ->
+    Acc;
+tl_to_json([{N, Atom} | Rest], Acc) when Atom == true; Atom == false ->
+    tl_to_json(Rest, Acc#{N => Atom});
+tl_to_json([{N, Atom} | Rest], Acc) when is_atom(Atom) ->
+    tl_to_json(Rest, Acc#{N => atom_to_binary(Atom, utf8)});
+tl_to_json([{N, Other} | Rest], Acc) ->
+    tl_to_json(Rest, Acc#{N => Other}).
+
+to_json([], _, Acc) ->
+    misc:json_encode(Acc);
+to_json([V | VRest], [F | FRest], Acc) ->
+    to_json(VRest, FRest, Acc#{F => V}).
+
+
+export_status(Host0) ->
+    Host = jid:nameprep(Host0),
+    case ejabberd_batch:task_status({db_export, Host}) of
+        not_started -> <<"Operation not started">>;
+        {failed, Steps, Error} ->
+            fmt("Operation failed after exporting ~p records with error ~s",
+                [Steps, misc:format_val(Error)]);
+        {aborted, Steps, _} ->
+            fmt("Operation was aborted after exporting ~p records",
+                [Steps]);
+        {working, Steps, Msg} ->
+            fmt("Operation in progress: '~s', exported ~p records so far",
+                [Msg, Steps]);
+        {completed, Steps, Msg} ->
+            fmt("Operation was completed after exporting ~p records: '~s'",
+                [Steps, Msg])
+    end.
+
+
+export_abort(Host0) ->
+    Host = jid:nameprep(Host0),
+    case ejabberd_batch:abort_task({db_export, Host}) of
+        aborted -> <<"Operation aborted">>;
+        not_started -> <<"No task running">>
+    end.
+
+
+import(Host0, Dir) ->
+    import(Host0, Dir, undefined).
+
+
+import(Host0, Dir, undefined) ->
+    Host = jid:nameprep(Host0),
+    import(Host, Dir, [ejabberd_auth | gen_mod:loaded_modules(Host)]);
+import(Host0, Dir, Mods) ->
+    Host = jid:nameprep(Host0),
+    Serialized = get_serialized_mods(Host, Dir),
+    ModsF = compatible_mods(Host, fun module_can_deserialize/3, Mods -- (Mods -- Serialized)),
+    F = fun Job({[], _State}) ->
+                MM = lists:map(fun({M, _}) -> atom_to_binary(M, latin1) end, ModsF),
+                {ok, undefined,
+                     0,
+                     fmt(<<"Deserialization finished for modules: ~s">>,
+                         [lists:join(<<", ">>, MM)])};
+            Job({[{Mod2, DbMod2} | Rest] = Mods2, Key}) ->
+                case read_batch(Host, Mod2, DbMod2, Dir, Key) of
+                    {ok, undefined, _Count} ->
+                        Job({Rest, undefined});
+                    {ok, NextKey, Count} ->
+                        {ok, {Mods2, NextKey},
+                             Count,
+                             <<"Deserializing ", (atom_to_binary(Mod2))/binary>>};
+                    {error, _} = E ->
+                        E
+                end
+        end,
+    case ejabberd_batch:register_task({db_import, Host},
+                                      0,
+                                      infinity,
+                                      {ModsF, undefined},
+                                      F) of
+        ok ->
+            {ok, <<"Import started">>};
+        {error, in_progress} ->
+            {error, <<"Operation in progress">>}
+    end.
+
+
+import_status(Host0) ->
+    Host = jid:nameprep(Host0),
+    case ejabberd_batch:task_status({db_import, Host}) of
+        not_started -> <<"Operation not started">>;
+        {failed, Steps, Error} ->
+            fmt("Operation failed after importing ~p records with error ~p",
+                [Steps, misc:format_val(Error)]);
+        {aborted, Steps, _} ->
+            fmt("Operation was aborted after importing ~p records",
+                [Steps]);
+        {working, Steps, Msg} ->
+            fmt("Operation in progress: '~s', imported ~p records so far",
+                [Msg, Steps]);
+        {completed, Steps, Msg} ->
+            fmt("Operation was completed after importing ~p records: '~s'",
+                [Steps, Msg])
+    end.
+
+
+import_abort(Host0) ->
+    Host = jid:nameprep(Host0),
+    case ejabberd_batch:abort_task({db_import, Host}) of
+        aborted -> <<"Operation aborted">>;
+        not_started -> <<"No task running">>
+    end.
+
+
+compatible_mods(Host, Fun, Mods) ->
+    lists:filtermap(
+      fun(ejabberd_auth) ->
+              lists:foldl(
+                fun(Method, false) ->
+                        DbMod = ejabberd:module_name([<<"auth">>, Method]),
+                        case Fun(Host, ejabberd_auth, DbMod) of
+                            {true, _} -> {true, {ejabberd_auth, DbMod}};
+                            _ -> false
+                        end;
+                   (_, Mod) -> Mod
+                end,
+                false,
+                ejabberd_option:auth_method(Host));
+         (Mod) ->
+              case Fun(Host, Mod, undefined) of
+                  {true, DbMod} ->
+                      {true, {Mod, DbMod}};
+                  _ -> false
+              end
+      end,
+      Mods).
+
+
+get_serialized_mods(Host, Dir) ->
+    Wildcard = binary_to_list(filename:join([Dir, <<Host/binary, "_*.dbser">>])),
+    lists:filtermap(
+      fun(Path) ->
+              case string:prefix(filename:basename(Path, ".dbser"), <<Host/binary, "_">>) of
+                  nomatch -> false;
+                  Mod ->
+                      try list_to_existing_atom(Mod) of
+                          Atom -> {true, Atom}
+                      catch
+                          _:_ -> false
+                      end
+              end
+      end,
+      filelib:wildcard(Wildcard)).
+
+
+module_can_serialize(Host, Mod, DbMod) ->
+    module_has_methods(Host, Mod, DbMod, [{serialize, 3}]).
+
+
+module_can_deserialize(Host, Mod, DbMod) ->
+    module_has_methods(Host, Mod, DbMod, [{deserialize, 2}, {deserialize_start, 1}]).
+
+
+module_has_methods(Host, Mod, undefined, Methods) ->
+    try {gen_mod:is_loaded(Host, Mod), gen_mod:db_mod(Host, Mod)} of
+        {true, DbMod} ->
+            module_has_methods(Host, Mod, DbMod, Methods);
+        _ ->
+            {error, not_loaded}
+    catch
+        _:_ -> false
+    end;
+module_has_methods(_Host, _Mod, DbMod, Methods) ->
+    case lists:all(
+           fun({Method, Arity}) ->
+                   erlang:function_exported(DbMod, Method, Arity)
+           end,
+           Methods) of
+        true ->
+            {true, DbMod};
+        _ ->
+            false
+    end.
+
+
+write_batch(WriteFun, Ext, Host, Mod, DbMod, Dir, undefined) ->
+    FN = <<Host/binary, "_", (atom_to_binary(Mod, latin1))/binary, ".", Ext/binary>>,
+    Path = filename:join([Dir, FN]),
+    case file:open(Path, [write, binary]) of
+        {ok, IO} ->
+            write_batch(WriteFun, Ext, Host, Mod, DbMod, Dir, {IO, Path, undefined});
+        {error, Msg} ->
+            {error, iolist_to_binary(io_lib:format("Unable to open file ~s for write: ~p",
+                                                   [Path, Msg]))}
+    end;
+write_batch(WriteFun, _Ext, Host, _Mod, DbMod, _Dir, {IO, Path, Key}) ->
+    case DbMod:serialize(Host, ?BATCH_SIZE, Key) of
+        {ok, [], _} ->
+            file:close(IO),
+            {ok, undefined, 0};
+        {ok, Data, NextKey} ->
+            case WriteFun(IO, Data) of
+                ok ->
+                    {ok, {IO, Path, NextKey}, length(Data)};
+                {error, Msg} ->
+                    file:close(IO),
+                    file:delete(Path),
+                    {error, iolist_to_binary(io_lib:format("Error when writing to file ~s: ~p",
+                                                           [Path, Msg]))}
+            end;
+        {error, Error} ->
+            file:close(IO),
+            file:delete(Path),
+            {error, iolist_to_binary(Error)}
+    end.
+
+update(#serialize_roster_v1{serverhost = ServerHost, entries = Entries, username = Username, version = Version}) ->
+    Entries2 = [{E1, E2, E3, E4, E5, E6, E7, false} || {E1, E2, E3, E4, E5, E6, E7} <- Entries],
+    #serialize_roster_v2{serverhost = ServerHost, username = Username, version = Version, entries = Entries2};
+update(Other) ->
+    Other.
+
+read_batch(Host, Mod, DbMod, Dir, undefined) ->
+    FN = <<Host/binary, "_", (atom_to_binary(Mod, latin1))/binary, ".dbser">>,
+    Path = filename:join([Dir, FN]),
+    case file:open(Path, [read, raw, binary]) of
+        {ok, IO} ->
+            DbMod:deserialize_start(Host),
+            read_batch(Host, Mod, DbMod, Dir, {IO, Path});
+        {error, Msg} ->
+            {error, iolist_to_binary(io_lib:format("Unable to open file ~s for read: ~p",
+                                                   [Path, Msg]))}
+    end;
+read_batch(Host, _Mod, DbMod, _Dir, {IO, Path}) ->
+    case file:read(IO, 8) of
+        {ok, <<"dbdb", Len:32/unsigned-little-integer>>} ->
+            case file:read(IO, Len) of
+                {ok, Data} when byte_size(Data) == Len ->
+                    try
+                        Decoded = erlang:binary_to_term(iolist_to_binary(Data)),
+                        Updated = lists:map(fun update/1, Decoded),
+                        case DbMod:deserialize(Host, Updated) of
+                            ok ->
+                                {ok, {IO, Path}, length(Decoded)};
+                            Err -> Err
+                        end
+                    catch
+                        E:M:S ->
+                            {error, fmt("Unable to decode data from file ~s: ~p:~p:~p", [Path, E, M, S])}
+                    end;
+                {ok, _} ->
+                    {error, fmt("File ~s is too short", [Path])};
+                eof ->
+                    {error, fmt("File ~s is too short", [Path])};
+                {error, Msg} ->
+                    {error, fmt("Error when reading file ~s: ~p", [Path, Msg])}
+            end;
+        {ok, _} ->
+            {error, fmt("File ~s has wrong header", [Path])};
+        eof ->
+            {ok, undefined, 0};
+        {error, Msg} ->
+            {error, fmt("Error when reading file ~s: ~p", [Path, Msg])}
+    end.
+
+
+fmt(Msg, Args) ->
+    iolist_to_binary(io_lib:format(Msg, Args)).
+
+
+iter_records([], Output, _) -> {ok, Output, fin};
+iter_records(fin, Output, _) -> {ok, Output, fin};
+iter_records(Key, Output, 0) -> {ok, Output, Key};
+iter_records([{First, _, Process} | Rest] = Funs, Output, EntriesLeft) ->
+    case First() of
+        {ok, Value, NextKey} ->
+            case Process(Value) of
+                {ok, Formated} ->
+                    iter_records({Funs, NextKey}, [Formated | Output], EntriesLeft - 1);
+                {error, Msg} ->
+                    {error, Msg};
+                skip ->
+                    iter_records({Funs, NextKey}, Output, EntriesLeft)
+            end;
+        fin ->
+            iter_records(Rest, Output, EntriesLeft);
+        {error, Msg} ->
+            {error, Msg}
+    end;
+iter_records({[{_, Next, Process} | Rest] = Funs, Key}, Output, EntriesLeft) ->
+    case Next(Key) of
+        {ok, Value, NextKey} ->
+            case Process(Value) of
+                {ok, Formated} ->
+                    iter_records({Funs, NextKey}, [Formated | Output], EntriesLeft - 1);
+                {error, Msg} ->
+                    {error, Msg};
+                skip ->
+                    iter_records({Funs, NextKey}, Output, EntriesLeft)
+            end;
+        fin ->
+            iter_records(Rest, Output, EntriesLeft);
+        {error, Msg} ->
+            {error, Msg}
+    end.
+
+
+mnesia_iter(Tab, Conv) ->
+    NV = fun({key, '$end_of_table'}) -> fin;
+            ({key, Key}) ->
+                 case mnesia:dirty_read(Tab, Key) of
+                     [] ->
+                         {ok, [], {key, mnesia:dirty_next(Tab, Key)}};
+                     [Single] ->
+                         {ok, [Single], {key, mnesia:dirty_next(Tab, Key)}};
+                     [First | Rest] ->
+                         {ok, [First], {bag, Rest, Key}}
+                 end;
+            ({bag, [Only], Key}) ->
+                 {ok, [Only], {key, mnesia:dirty_next(Tab, Key)}};
+            ({bag, [First | Rest], Key}) ->
+                 {ok, [First], {bag, Rest, Key}}
+         end,
+    {fun() ->
+             NV({key, mnesia:dirty_first(Tab)})
+     end,
+     NV,
+     Conv}.

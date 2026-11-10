@@ -3,7 +3,7 @@
 %%% Created : 14 Nov 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -26,12 +26,13 @@
 %% API
 -compile(export_all).
 -import(suite, [get_features/1, disconnect/1, my_jid/1, send_recv/2,
-		wait_for_slave/1, server_jid/1, send/2, get_features/2,
-		wait_for_master/1, recv_message/1, recv_iq/1, muc_room_jid/1,
+		server_jid/1, send/2, get_features/2,
+		wait_for_peer/1, recv_message/1, recv_iq/1, muc_room_jid/1,
 		muc_jid/1, is_feature_advertised/3, get_event/1, put_event/2]).
 
 -include("suite.hrl").
--define(VERSIONS, [?NS_MAM_TMP, ?NS_MAM_0, ?NS_MAM_1]).
+-define(VERSIONS, [?NS_MAM_TMP, ?NS_MAM_0, ?NS_MAM_1, ?NS_MAM_2]).
+-define(has_stanza(Els, Stanza), ?not_match([], [El || El = Stanza <- Els])).
 
 %%%===================================================================
 %%% API
@@ -44,7 +45,8 @@ single_cases() ->
      [single_test(feature_enabled),
       single_test(get_set_prefs),
       single_test(get_form),
-      single_test(fake_by)]}.
+      single_test(fake_by),
+      single_test(remove_room)]}.
 
 feature_enabled(Config) ->
     BareMyJID = jid:remove_resource(my_jid(Config)),
@@ -58,22 +60,24 @@ feature_enabled(Config) ->
     true = sets:is_subset(RequiredFeatures, UserFeatures),
     ct:comment("Checking if all MAM conference service features are enabled"),
     true = lists:member(?NS_MAM_1, MUCFeatures),
+    true = lists:member(?NS_MAM_2, MUCFeatures),
+    true = lists:member(?NS_MAM_2_EXTENDED, MUCFeatures),
     clean(disconnect(Config)).
 
 fake_by(Config) ->
     BareServerJID = server_jid(Config),
-    FullServerJID = jid:replace_resource(BareServerJID, randoms:get_string()),
+    FullServerJID = jid:replace_resource(BareServerJID, p1_rand:get_string()),
     FullMyJID = my_jid(Config),
     BareMyJID = jid:remove_resource(FullMyJID),
     Fakes = lists:flatmap(
 	      fun(JID) ->
-		      [#mam_archived{id = randoms:get_string(), by = JID},
-		       #stanza_id{id = randoms:get_string(), by = JID}]
+		      [#mam_archived{id = p1_rand:get_string(), by = JID},
+		       #stanza_id{id = p1_rand:get_string(), by = JID}]
 	      end, [BareServerJID, FullServerJID, BareMyJID, FullMyJID]),
     Body = xmpp:mk_text(<<"body">>),
-    ForeignJID = jid:make(randoms:get_string()),
-    Archived = #mam_archived{id = randoms:get_string(), by = ForeignJID},
-    StanzaID = #stanza_id{id = randoms:get_string(), by = ForeignJID},
+    ForeignJID = jid:make(p1_rand:get_string()),
+    Archived = #mam_archived{id = p1_rand:get_string(), by = ForeignJID},
+    StanzaID = #stanza_id{id = p1_rand:get_string(), by = ForeignJID},
     #message{body = Body, sub_els = SubEls} =
 	send_recv(Config, #message{to = FullMyJID,
 				   body = Body,
@@ -113,7 +117,20 @@ get_form(Config) ->
     Range = [{JID, NS} || JID <- [undefined, ServerJID],
 			  NS <- ?VERSIONS -- [?NS_MAM_TMP]],
     lists:foreach(
-      fun({To, NS}) ->
+      fun({To, ?NS_MAM_2 = NS}) ->
+	      #iq{type = result,
+		  sub_els = [#mam_query{xmlns = NS,
+					xdata = #xdata{} = X}]} =
+		  send_recv(Config, #iq{type = get, to = To,
+					sub_els = [#mam_query{xmlns = NS}]}),
+	      [NS] = xmpp_util:get_xdata_values(<<"FORM_TYPE">>, X),
+	      true = xmpp_util:has_xdata_var(<<"with">>, X),
+	      true = xmpp_util:has_xdata_var(<<"start">>, X),
+	      true = xmpp_util:has_xdata_var(<<"end">>, X),
+	      true = xmpp_util:has_xdata_var(<<"after-id">>, X),
+	      true = xmpp_util:has_xdata_var(<<"before-id">>, X),
+	      true = xmpp_util:has_xdata_var(<<"ids">>, X);
+         ({To, NS}) ->
 	      #iq{type = result,
 		  sub_els = [#mam_query{xmlns = NS,
 					xdata = #xdata{} = X}]} =
@@ -126,6 +143,76 @@ get_form(Config) ->
       end, Range),
     clean(disconnect(Config)).
 
+remove_room(Config) ->
+    Server = ?config(server, Config),
+    Service = <<"conference.", Server/binary>>,
+    Room1 = jid:make(<<"mamremove1">>, Service),
+    Room2 = jid:make(<<"mamremove2">>, Service),
+    Me = jid:encode(jid:remove_resource(my_jid(Config))),
+    Other = <<"other@", Server/binary>>,
+    Now = erlang:system_time(second),
+    lists:foreach(
+      fun(Room) ->
+	      ok = muc_tests:join_new(Config, Room),
+	      [104] = muc_tests:set_config(Config, [{mam, true}], Room)
+      end, [Room1, Room2]),
+    Fill = fun(Room) ->
+		   send_messages_to_room(Config, Room, [1, 2]),
+		   ?match(2, count_room_archive(Config, Room))
+	   end,
+    Removed = fun(N) -> {ok, <<"Removed ", (integer_to_binary(N))/binary,
+			       " messages from MAM archive">>} end,
+    Remove = fun(Name, Args) ->
+		     ejabberd_commands:execute_command2(
+		       Name, [<<"mamremove1">>, Service | Args],
+		       #{caller_module => ejabberd_ctl}, 1000000)
+	     end,
+    R0 = Removed(0),
+    R2 = Removed(2),
+    Fill(Room1),
+    Fill(Room2),
+    ct:comment("Nothing is removed for another user or outside the time range"),
+    ?match(R0, Remove(remove_mam_for_user_in_room, [Other])),
+    ?match(R0, Remove(remove_mam_for_room_with_time_range,
+		      [Now - 3600, Now - 1800])),
+    ?match(R0, Remove(remove_mam_for_user_in_room_with_time_range,
+		      [Me, Now - 3600, Now - 1800])),
+    ?match(R0, Remove(remove_mam_for_user_in_room_with_time_range,
+		      [Other, Now - 60, Now + 60])),
+    ?match(2, count_room_archive(Config, Room1)),
+    ct:comment("Removing matching messages"),
+    ?match(R2, Remove(remove_mam_for_user_in_room_with_time_range,
+		      [Me, Now - 60, Now + 60])),
+    ?match(0, count_room_archive(Config, Room1)),
+    Fill(Room1),
+    ?match(R2, Remove(remove_mam_for_user_in_room, [Me])),
+    ?match(0, count_room_archive(Config, Room1)),
+    Fill(Room1),
+    ?match(R2, Remove(remove_mam_for_room_with_time_range,
+		      [Now - 60, Now + 60])),
+    ?match(0, count_room_archive(Config, Room1)),
+    Fill(Room1),
+    ?match(R2, Remove(remove_mam_for_room, [])),
+    ?match(0, count_room_archive(Config, Room1)),
+    ct:comment("Other room archive is untouched"),
+    ?match(2, count_room_archive(Config, Room2)),
+    ct:comment("Invalid arguments"),
+    ?match({error, <<"Invalid time range">>},
+	   Remove(remove_mam_for_room_with_time_range, [Now, Now - 1])),
+    ?match({error, <<"Unknown MUC service">>},
+	   mod_mam:remove_mam_for_room(<<"mamremove1">>, <<"unknown.", Server/binary>>)),
+    lists:foreach(fun(Room) -> muc_tests:leave(Config, Room) end, [Room1, Room2]),
+    clean(disconnect(Config)).
+
+count_room_archive(Config, Room) ->
+    #iq{type = result,
+	sub_els = [#mam_fin{rsm = #rsm_set{count = Count}}]} =
+	send_recv(Config, #iq{type = set, to = Room,
+			      sub_els = [#mam_query{xmlns = ?NS_MAM_2,
+						    id = p1_rand:get_string(),
+						    rsm = #rsm_set{max = 0}}]}),
+    Count.
+
 %%%===================================================================
 %%% Master-slave tests
 %%%===================================================================
@@ -134,21 +221,27 @@ master_slave_cases() ->
      [master_slave_test(archived_and_stanza_id),
       master_slave_test(query_all),
       master_slave_test(query_with),
+      master_slave_test(query_ids),
+      master_slave_test(query_metadata),
+      master_slave_test(query_wrong_jid),
       master_slave_test(query_rsm_max),
       master_slave_test(query_rsm_after),
       master_slave_test(query_rsm_before),
-      master_slave_test(muc)]}.
+      master_slave_test(muc),
+      master_slave_test(mucsub),
+      master_slave_test(mucsub_from_muc),
+      master_slave_test(mucsub_from_muc_non_persistent)]}.
 
 archived_and_stanza_id_master(Config) ->
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     clean(disconnect(Config)).
 
 archived_and_stanza_id_slave(Config) ->
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     clean(disconnect(Config)).
 
@@ -157,7 +250,7 @@ query_all_master(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     query_all(Config, MyJID, Peer),
     clean(disconnect(Config)).
@@ -167,7 +260,7 @@ query_all_slave(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     query_all(Config, Peer, MyJID),
     clean(disconnect(Config)).
@@ -177,7 +270,7 @@ query_with_master(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     query_with(Config, MyJID, Peer),
     clean(disconnect(Config)).
@@ -187,9 +280,61 @@ query_with_slave(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     query_with(Config, Peer, MyJID),
+    clean(disconnect(Config)).
+
+query_ids_master(Config) ->
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    send_messages(Config, lists:seq(1, 5)),
+    clean(disconnect(Config)).
+
+query_ids_slave(Config) ->
+    Peer = ?config(peer, Config),
+    MyJID = my_jid(Config),
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    IDs = recv_messages(Config, lists:seq(1, 5)),
+    query_by_ids(Config, Peer, MyJID, IDs),
+    clean(disconnect(Config)).
+
+query_metadata_master(Config) ->
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    send_messages(Config, lists:seq(1, 5)),
+    clean(disconnect(Config)).
+
+query_metadata_slave(Config) ->
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    IDs = recv_messages(Config, lists:seq(1, 5)),
+    query_metadata(Config, lists:nth(length(IDs) - 1, IDs), hd(IDs)),
+    clean(disconnect(Config)).
+
+query_wrong_jid_master(Config) ->
+    Peer = ?config(peer, Config),
+    MyJID = my_jid(Config),
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    send_messages(Config, lists:seq(1, 5)),
+    query_all_err(Config, MyJID, jid:remove_resource(Peer)),
+    clean(disconnect(Config)).
+
+query_wrong_jid_slave(Config) ->
+    Peer = ?config(peer, Config),
+    MyJID = my_jid(Config),
+    ok = set_default(Config, always),
+    #presence{} = send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+    recv_messages(Config, lists:seq(1, 5)),
+    query_all_err(Config, MyJID, jid:remove_resource(Peer)),
     clean(disconnect(Config)).
 
 query_rsm_max_master(Config) ->
@@ -197,7 +342,7 @@ query_rsm_max_master(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     query_rsm_max(Config, MyJID, Peer),
     clean(disconnect(Config)).
@@ -207,7 +352,7 @@ query_rsm_max_slave(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     query_rsm_max(Config, Peer, MyJID),
     clean(disconnect(Config)).
@@ -217,7 +362,7 @@ query_rsm_after_master(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     query_rsm_after(Config, MyJID, Peer),
     clean(disconnect(Config)).
@@ -227,7 +372,7 @@ query_rsm_after_slave(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     query_rsm_after(Config, Peer, MyJID),
     clean(disconnect(Config)).
@@ -237,7 +382,7 @@ query_rsm_before_master(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_slave(Config),
+    wait_for_peer(Config),
     send_messages(Config, lists:seq(1, 5)),
     query_rsm_before(Config, MyJID, Peer),
     clean(disconnect(Config)).
@@ -247,7 +392,7 @@ query_rsm_before_slave(Config) ->
     MyJID = my_jid(Config),
     ok = set_default(Config, always),
     #presence{} = send_recv(Config, #presence{}),
-    wait_for_master(Config),
+    wait_for_peer(Config),
     recv_messages(Config, lists:seq(1, 5)),
     query_rsm_before(Config, Peer, MyJID),
     clean(disconnect(Config)).
@@ -259,6 +404,7 @@ muc_master(Config) ->
     %% MAM feature should not be advertised at this point,
     %% because MAM is not enabled so far
     false = is_feature_advertised(Config, ?NS_MAM_1, Room),
+    false = is_feature_advertised(Config, ?NS_MAM_2, Room),
     %% Fill in some history
     send_messages_to_room(Config, lists:seq(1, 21)),
     %% We now should be able to retrieve those via MAM, even though
@@ -266,34 +412,135 @@ muc_master(Config) ->
     recv_messages_from_room(Config, lists:seq(2, 21)),
     %% Now enable MAM for the conference
     %% Retrieve config first
-    #iq{type = result, sub_els = [#muc_owner{config = #xdata{} = RoomCfg}]} =
-        send_recv(Config, #iq{type = get, sub_els = [#muc_owner{}],
-                              to = Room}),
-    %% Find the MAM field in the config and enable it
-    NewFields = lists:flatmap(
-		  fun(#xdata_field{var = <<"mam">> = Var}) ->
-			  [#xdata_field{var = Var, values = [<<"1">>]}];
-		     (_) ->
-			  []
-		  end, RoomCfg#xdata.fields),
-    NewRoomCfg = #xdata{type = submit, fields = NewFields},
-    #iq{type = result, sub_els = []} =
-	send_recv(Config, #iq{type = set, to = Room,
-			      sub_els = [#muc_owner{config = NewRoomCfg}]}),
-    #message{from = Room, type = groupchat,
-	     sub_els = [#muc_user{status_codes = [104]}]} = recv_message(Config),
+    CfgOpts = muc_tests:get_config(Config),
+    %% Find the MAM field in the config
+    true = proplists:is_defined(mam, CfgOpts),
+    %% Enable MAM
+    [104] = muc_tests:set_config(Config, [{mam, true}]),
     %% Check if MAM has been enabled
     true = is_feature_advertised(Config, ?NS_MAM_1, Room),
+    true = is_feature_advertised(Config, ?NS_MAM_2, Room),
     %% We now sending some messages again
-    send_messages_to_room(Config, lists:seq(1, 5)),
+    send_messages_to_room(Config, lists:seq(101, 105)),
     %% And retrieve them via MAM again.
-    recv_messages_from_room(Config, lists:seq(1, 5)),
+    recv_messages_from_room(Config, lists:seq(101, 105)),
     put_event(Config, disconnect),
+    muc_tests:leave(Config),
     clean(disconnect(Config)).
 
 muc_slave(Config) ->
     disconnect = get_event(Config),
     clean(disconnect(Config)).
+
+mucsub_master(Config) ->
+    Room = muc_room_jid(Config),
+    Peer = ?config(peer, Config),
+    wait_for_peer(Config),
+    ct:comment("Joining muc room"),
+    ok = muc_tests:join_new(Config),
+
+    ct:comment("Enabling mam in room"),
+    CfgOpts = muc_tests:get_config(Config),
+    %% Find the MAM field in the config
+    ?match(true, proplists:is_defined(mam, CfgOpts)),
+    ?match(true, proplists:is_defined(allow_subscription, CfgOpts)),
+    %% Enable MAM
+    [104] = muc_tests:set_config(Config, [{mam, true}, {allow_subscription, true}]),
+
+    ct:comment("Subscribing peer to room"),
+    ?send_recv(#iq{to = Room, type = set, sub_els = [
+	#muc_subscribe{jid = Peer, nick = <<"peer">>,
+		       events = [?NS_MUCSUB_NODES_MESSAGES]}
+    ]}, #iq{type = result}),
+
+    ct:comment("Sending messages to room"),
+    send_messages_to_room(Config, lists:seq(1, 5)),
+
+    ct:comment("Retrieving messages from room mam storage"),
+    recv_messages_from_room(Config, lists:seq(1, 5)),
+
+    ct:comment("Cleaning up"),
+    put_event(Config, ready),
+    ready = get_event(Config),
+    muc_tests:leave(Config),
+    clean(disconnect(Config)).
+
+mucsub_slave(Config) ->
+    Room = muc_room_jid(Config),
+    MyJID = my_jid(Config),
+    MyJIDBare = jid:remove_resource(MyJID),
+    ok = set_default(Config, always),
+    send_recv(Config, #presence{}),
+    wait_for_peer(Config),
+
+    ct:comment("Receiving mucsub events"),
+    lists:foreach(
+	fun(N) ->
+	    Body = xmpp:mk_text(integer_to_binary(N)),
+	    Msg = ?match(#message{from = Room, type = normal} = Msg, recv_message(Config), Msg),
+	    PS = ?match(#ps_event{items = #ps_items{node = ?NS_MUCSUB_NODES_MESSAGES, items = [
+		#ps_item{} = PS
+	    ]}}, xmpp:get_subtag(Msg, #ps_event{}), PS),
+	    ?match(#message{type = groupchat, body = Body}, xmpp:get_subtag(PS, #message{}))
+	end, lists:seq(1, 5)),
+
+    ct:comment("Retrieving personal mam archive"),
+    QID = p1_rand:get_string(),
+    I = send(Config, #iq{type = set,
+			 sub_els = [#mam_query{xmlns = ?NS_MAM_2, id = QID}]}),
+    lists:foreach(
+	fun(N) ->
+	    Body = xmpp:mk_text(integer_to_binary(N)),
+	    Forw = ?match(#message{
+		to = MyJID, from = MyJIDBare,
+		sub_els = [#mam_result{
+		    xmlns = ?NS_MAM_2,
+		    queryid = QID,
+		    sub_els = [#forwarded{
+			delay = #delay{}} = Forw]}]},
+			  recv_message(Config), Forw),
+	    IMsg = ?match(#message{
+		to = MyJIDBare, from = Room} = IMsg, xmpp:get_subtag(Forw, #message{}), IMsg),
+
+	    PS = ?match(#ps_event{items = #ps_items{node = ?NS_MUCSUB_NODES_MESSAGES, items = [
+		#ps_item{} = PS
+	    ]}}, xmpp:get_subtag(IMsg, #ps_event{}), PS),
+	    ?match(#message{type = groupchat, body = Body}, xmpp:get_subtag(PS, #message{}))
+	end, lists:seq(1, 5)),
+    RSM = ?match(#iq{from = MyJIDBare, id = I, type = result,
+		     sub_els = [#mam_fin{xmlns = ?NS_MAM_2,
+					 rsm = RSM,
+					 complete = true}]}, recv_iq(Config), RSM),
+    match_rsm_count(RSM, 5),
+
+    % Wait for master exit
+    ready = get_event(Config),
+    % Unsubscribe yourself
+    ?send_recv(#iq{to = Room, type = set, sub_els = [
+	#muc_unsubscribe{}
+    ]}, #iq{type = result}),
+    put_event(Config, ready),
+    clean(disconnect(Config)).
+
+mucsub_from_muc_master(Config) ->
+    mucsub_master(Config).
+
+mucsub_from_muc_slave(Config) ->
+    Server = ?config(server, Config),
+    gen_mod:update_module(Server, mod_mam, #{user_mucsub_from_muc_archive => true}),
+    Config2 = mucsub_slave(Config),
+    gen_mod:update_module(Server, mod_mam, #{user_mucsub_from_muc_archive => false}),
+    Config2.
+
+mucsub_from_muc_non_persistent_master(Config) ->
+    Config1 = lists:keystore(persistent_room, 1, Config, {persistent_room, false}),
+    Config2 = mucsub_from_muc_master(Config1),
+    lists:keydelete(persistent_room, 1, Config2).
+
+mucsub_from_muc_non_persistent_slave(Config) ->
+    Config1 = lists:keystore(persistent_room, 1, Config, {persistent_room, false}),
+    Config2 = mucsub_from_muc_slave(Config1),
+    lists:keydelete(persistent_room, 1, Config2).
 
 %%%===================================================================
 %%% Internal functions
@@ -325,30 +572,40 @@ set_default(Config, Default) ->
 
 send_messages(Config, Range) ->
     Peer = ?config(peer, Config),
+    send_message_extra(Config, 0, <<"to-retract-1">>, []),
     lists:foreach(
-      fun(N) ->
+      fun
+	  (1) ->
+	      send_message_extra(Config, 1, <<"retraction-1">>, [#message_retract{id = <<"to-retract-1">>}]);
+	  (N) ->
 	      Body = xmpp:mk_text(integer_to_binary(N)),
               send(Config, #message{to = Peer, body = Body})
       end, Range).
 
+send_message_extra(Config, N, Id, Sub) ->
+    Peer = ?config(peer, Config),
+    Body = xmpp:mk_text(integer_to_binary(N)),
+    send(Config, #message{id = Id, to = Peer, body = Body, sub_els = Sub}).
+
 recv_messages(Config, Range) ->
     Peer = ?config(peer, Config),
-    lists:foreach(
-      fun(N) ->
+    lists:foldl(
+      fun(N, IDs) ->
 	      Body = xmpp:mk_text(integer_to_binary(N)),
 	      #message{from = Peer, body = Body} = Msg =
 		  recv_message(Config),
-	      #mam_archived{by = BareMyJID} =
+	      #mam_archived{by = BareMyJID, id = ID} =
 		  xmpp:get_subtag(Msg, #mam_archived{}),
 	      #stanza_id{by = BareMyJID} =
-		  xmpp:get_subtag(Msg, #stanza_id{})
-      end, Range).
+		  xmpp:get_subtag(Msg, #stanza_id{}),
+              [ID | IDs]
+      end, [], [0 | Range]).
 
 recv_archived_messages(Config, From, To, QID, Range) ->
     MyJID = my_jid(Config),
     lists:foreach(
       fun(N) ->
-	      ct:comment("Retreiving ~pth message in range ~p",
+	      ct:comment("Retrieving ~pth message in range ~p",
 			 [N, Range]),
               Body = xmpp:mk_text(integer_to_binary(N)),
               #message{to = MyJID,
@@ -358,7 +615,7 @@ recv_archived_messages(Config, From, To, QID, Range) ->
                                sub_els =
                                    [#forwarded{
                                        delay = #delay{},
-                                       xml_els = [El]}]}]} = recv_message(Config),
+                                       sub_els = [El]}]}]} = recv_message(Config),
 	      #message{from = From, to = To,
 		       body = Body} = xmpp:decode(El)
       end, Range).
@@ -377,15 +634,14 @@ send_query(Config, #mam_query{xmlns = NS} = Query) ->
     maybe_recv_iq_result(Config, NS, I),
     I.
 
-recv_fin(Config, I, QueryID, ?NS_MAM_1 = NS, IsComplete) ->
+recv_fin(Config, I, _QueryID, NS, IsComplete) when NS == ?NS_MAM_1; NS == ?NS_MAM_2 ->
     ct:comment("Receiving fin iq for namespace '~s'", [NS]),
     #iq{type = result, id = I,
 	sub_els = [#mam_fin{xmlns = NS,
-			    id = QueryID,
 			    complete = Complete,
 			    rsm = RSM}]} = recv_iq(Config),
     ct:comment("Checking if complete is ~s", [IsComplete]),
-    Complete = IsComplete,
+    ?match(IsComplete, Complete),
     RSM;
 recv_fin(Config, I, QueryID, ?NS_MAM_TMP = NS, _IsComplete) ->
     ct:comment("Receiving fin iq for namespace '~s'", [NS]),
@@ -402,12 +658,17 @@ recv_fin(Config, _, QueryID, ?NS_MAM_0 = NS, IsComplete) ->
 	     complete = Complete,
 	     rsm = RSM} = xmpp:get_subtag(FinMsg, #mam_fin{xmlns = NS}),
     ct:comment("Checking if complete is ~s", [IsComplete]),
-    Complete = IsComplete,
+    ?match(IsComplete, Complete),
     RSM.
 
 send_messages_to_room(Config, Range) ->
     MyNick = ?config(master_nick, Config),
-    Room = muc_room_jid(Config),
+    send_messages_to_room(Config, muc_room_jid(Config), MyNick, Range).
+
+send_messages_to_room(Config, Room, Range) ->
+    send_messages_to_room(Config, Room, ?config(nick, Config), Range).
+
+send_messages_to_room(Config, Room, MyNick, Range) ->
     MyNickJID = jid:replace_resource(Room, MyNick),
     lists:foreach(
       fun(N) ->
@@ -424,10 +685,9 @@ recv_messages_from_room(Config, Range) ->
     Room = muc_room_jid(Config),
     MyNickJID = jid:replace_resource(Room, MyNick),
     MyJID = my_jid(Config),
-    QID = randoms:get_string(),
-    Count = length(Range),
+    QID = p1_rand:get_string(),
     I = send(Config, #iq{type = set, to = Room,
-			 sub_els = [#mam_query{xmlns = ?NS_MAM_1, id = QID}]}),
+			 sub_els = [#mam_query{xmlns = ?NS_MAM_2, id = QID}]}),
     lists:foreach(
       fun(N) ->
 	      Body = xmpp:mk_text(integer_to_binary(N)),
@@ -435,21 +695,23 @@ recv_messages_from_room(Config, Range) ->
 		 to = MyJID, from = Room,
 		 sub_els =
 		     [#mam_result{
-			 xmlns = ?NS_MAM_1,
+			 xmlns = ?NS_MAM_2,
 			 queryid = QID,
 			 sub_els =
 			     [#forwarded{
 				 delay = #delay{},
-				 xml_els = [El]}]}]} = recv_message(Config),
+				 sub_els = [El]}]}]} = recv_message(Config),
 	      #message{from = MyNickJID,
 		       type = groupchat,
-		       body = Body} = xmpp:decode(El)
+		       body = Body} = Nested = xmpp:decode(El),
+	      ct:comment("Verify that there is just single stanza-id", []),
+	      ?match([#stanza_id{}], xmpp:get_subtags(Nested, #stanza_id{}))
       end, Range),
     #iq{from = Room, id = I, type = result,
-	sub_els = [#mam_fin{xmlns = ?NS_MAM_1,
-			    id = QID,
-			    rsm = #rsm_set{count = Count},
-			    complete = true}]} = recv_iq(Config).
+	sub_els = [#mam_fin{xmlns = ?NS_MAM_2,
+			    rsm = RSM,
+			    complete = true}]} = recv_iq(Config),
+    match_rsm_count(RSM, length(Range)).
 
 query_all(Config, From, To) ->
     lists:foreach(
@@ -458,11 +720,12 @@ query_all(Config, From, To) ->
       end, ?VERSIONS).
 
 query_all(Config, From, To, NS) ->
-    QID = randoms:get_string(),
+    QID = p1_rand:get_string(),
     Range = lists:seq(1, 5),
     ID = send_query(Config, #mam_query{xmlns = NS, id = QID}),
     recv_archived_messages(Config, From, To, QID, Range),
-    #rsm_set{count = 5} = recv_fin(Config, ID, QID, NS, _Complete = true).
+    RSM = recv_fin(Config, ID, QID, NS, _Complete = true),
+    match_rsm_count(RSM, 5).
 
 query_with(Config, From, To) ->
     lists:foreach(
@@ -473,7 +736,7 @@ query_with(Config, From, To) ->
 query_with(Config, From, To, NS) ->
     Peer = ?config(peer, Config),
     BarePeer = jid:remove_resource(Peer),
-    QID = randoms:get_string(),
+    QID = p1_rand:get_string(),
     Range = lists:seq(1, 5),
     lists:foreach(
       fun(JID) ->
@@ -488,8 +751,83 @@ query_with(Config, From, To, NS) ->
 		      end,
 	      ID = send_query(Config, Query),
 	      recv_archived_messages(Config, From, To, QID, Range),
-	      #rsm_set{count = 5} = recv_fin(Config, ID, QID, NS, true)
+	      RSM = recv_fin(Config, ID, QID, NS, true),
+	      match_rsm_count(RSM, 5)
       end, [Peer, BarePeer]).
+
+query_by_ids(Config, From, To, IDs) ->
+    %% IDs is reversed, last is retracted
+    query_with_cfg(Config, From, To, [{ids, lists:reverse(lists:droplast(IDs))}], lists:seq(1,5)),
+
+    query_with_cfg(Config, From, To, [{'before-id', hd(IDs)}], lists:seq(1, 4)),
+    query_with_cfg(Config, From, To, [{'after-id', hd(IDs)}], []),
+
+    query_with_cfg(Config, From, To, [{'after-id', lists:last(lists:droplast(IDs))}], lists:seq(2, 5)),
+    query_with_cfg(Config, From, To, [{'before-id',lists:last(lists:droplast(IDs))}], []),
+
+    ct:comment("Testing querying for bad ids"),
+    test_bad_id(Config, lists:last(IDs)),
+    test_bad_id(Config, <<"1234">>),
+    test_bad_id(Config, <<"; DROP TABLE archive">>),
+    %% one foul egg is enough
+    #iq{type = error, sub_els = SubEls1} =
+        send_mam2_query_iq(Config, mam_query:encode([{ids, lists:reverse(lists:droplast(IDs))},
+                                                     {'before-id', lists:last(IDs)}])),
+    ?has_stanza(SubEls1, #stanza_error{type = cancel, reason = 'item-not-found'}).
+
+query_with_cfg(Config, From, To, Cfg, Range) ->
+    ct:comment("Querying with cfg ~p", [Cfg]),
+    QID = p1_rand:get_string(),
+    Fs = mam_query:encode(Cfg),
+    Query = #mam_query{xmlns = ?NS_MAM_2, id = QID,
+                       xdata = #xdata{type = submit,
+                                      fields = Fs}},
+    ID = send_query(Config, Query),
+    recv_archived_messages(Config, From, To, QID, Range),
+    RSM = recv_fin(Config, ID, QID, ?NS_MAM_2, true),
+    match_rsm_count(RSM, length(Range)).
+
+
+test_bad_id(Config, BadID) ->
+    #iq{type = error, sub_els = SubEls1} =
+        send_mam2_query_iq(Config, mam_query:encode([{ids, [BadID]}])),
+    ?has_stanza(SubEls1, #stanza_error{type = cancel, reason = 'item-not-found'}),
+    #iq{type = error, sub_els = SubEls2} =
+        send_mam2_query_iq(Config, mam_query:encode([{'before-id', BadID}])),
+    ?has_stanza(SubEls2, #stanza_error{type = cancel, reason = 'item-not-found'}),
+    #iq{type = error, sub_els = SubEls3} =
+        send_mam2_query_iq(Config, mam_query:encode([{'after-id', BadID}])),
+    ?has_stanza(SubEls3, #stanza_error{type = cancel, reason = 'item-not-found'}).
+
+send_mam2_query_iq(Config, Fs) ->
+    QID = p1_rand:get_string(),
+    send_recv(Config,
+              #iq{type = set,
+                  sub_els = [#mam_query{xmlns = ?NS_MAM_2, id = QID,
+                                        xdata = #xdata{type = submit, fields = Fs}}]}).
+
+
+query_metadata(Config, Start, End) ->
+    #iq{type = result,
+        sub_els =
+            [#mam_metadata{start = #mam_metadata_start{id = Start},
+                           'end' = #mam_metadata_end{id = End}}]
+       } = send_recv(Config, #iq{type = get, sub_els = [#mam_metadata{}]}).
+
+query_all_err(Config, From, To) ->
+    lists:foreach(
+      fun(NS) ->
+	      query_all_err(Config, From, To, NS)
+      end, ?VERSIONS).
+
+query_all_err(Config, _From, To, NS) ->
+    QID = p1_rand:get_string(),
+    Type = query_iq_type(NS),
+    #iq{type = error, sub_els = SubEls} =
+        send_recv(Config, #iq{type = Type,
+                              to = To,
+                              sub_els = [#mam_query{xmlns = NS, id = QID}]}),
+    ?has_stanza(SubEls, #stanza_error{type = cancel, reason = 'not-allowed'}).
 
 query_rsm_max(Config, From, To) ->
     lists:foreach(
@@ -500,13 +838,14 @@ query_rsm_max(Config, From, To) ->
 query_rsm_max(Config, From, To, NS) ->
     lists:foreach(
       fun(Max) ->
-	      QID = randoms:get_string(),
+	      QID = p1_rand:get_string(),
 	      Range = lists:sublist(lists:seq(1, Max), 5),
 	      Query = #mam_query{xmlns = NS, id = QID, rsm = #rsm_set{max = Max}},
 	      ID = send_query(Config, Query),
 	      recv_archived_messages(Config, From, To, QID, Range),
 	      IsComplete = Max >= 5,
-	      #rsm_set{count = 5} = recv_fin(Config, ID, QID, NS, IsComplete)
+	      RSM = recv_fin(Config, ID, QID, NS, IsComplete),
+	      match_rsm_count(RSM, 5)
       end, lists:seq(0, 6)).
 
 query_rsm_after(Config, From, To) ->
@@ -520,13 +859,14 @@ query_rsm_after(Config, From, To, NS) ->
       fun(Range, #rsm_first{data = After}) ->
 	      ct:comment("Retrieving ~p messages after '~s'",
 			 [length(Range), After]),
-	      QID = randoms:get_string(),
+	      QID = p1_rand:get_string(),
 	      Query = #mam_query{xmlns = NS, id = QID,
 				 rsm = #rsm_set{'after' = After}},
 	      ID = send_query(Config, Query),
 	      recv_archived_messages(Config, From, To, QID, Range),
-	      #rsm_set{count = 5, first = First} =
+	      RSM = #rsm_set{first = First} =
 		  recv_fin(Config, ID, QID, NS, true),
+	      match_rsm_count(RSM, 5),
 	      First
       end, #rsm_first{data = undefined},
       [lists:seq(N, 5) || N <- lists:seq(1, 6)]).
@@ -534,7 +874,8 @@ query_rsm_after(Config, From, To, NS) ->
 query_rsm_before(Config, From, To) ->
     lists:foreach(
       fun(NS) ->
-	      query_rsm_before(Config, From, To, NS)
+	  query_rsm_before(Config, From, To, NS),
+	  query_last_message(Config, From, To, NS)
       end, ?VERSIONS).
 
 query_rsm_before(Config, From, To, NS) ->
@@ -542,12 +883,30 @@ query_rsm_before(Config, From, To, NS) ->
       fun(Range, Before) ->
 	      ct:comment("Retrieving ~p messages before '~s'",
 			 [length(Range), Before]),
-	      QID = randoms:get_string(),
+	      QID = p1_rand:get_string(),
 	      Query = #mam_query{xmlns = NS, id = QID,
 				 rsm = #rsm_set{before = Before}},
 	      ID = send_query(Config, Query),
 	      recv_archived_messages(Config, From, To, QID, Range),
-	      #rsm_set{count = 5, last = Last} =
+	      RSM = #rsm_set{last = Last} =
 		  recv_fin(Config, ID, QID, NS, true),
+	      match_rsm_count(RSM, 5),
 	      Last
       end, <<"">>, lists:reverse([lists:seq(1, N) || N <- lists:seq(0, 5)])).
+
+query_last_message(Config, From, To, NS) ->
+    ct:comment("Retrieving last message", []),
+    QID = p1_rand:get_string(),
+    Query = #mam_query{xmlns = NS, id = QID,
+		       rsm = #rsm_set{before = <<>>, max = 1}},
+    ID = send_query(Config, Query),
+    recv_archived_messages(Config, From, To, QID, [5]),
+    RSM = ?match(#rsm_set{} = RSM, recv_fin(Config, ID, QID, NS, false), RSM),
+    match_rsm_count(RSM, 5).
+
+match_rsm_count(#rsm_set{count = undefined}, _) ->
+    %% The backend doesn't support counting
+    ok;
+match_rsm_count(#rsm_set{count = Count1}, Count2) ->
+    ct:comment("Checking if RSM 'count' is ~p", [Count2]),
+    ?match(Count2, Count1).

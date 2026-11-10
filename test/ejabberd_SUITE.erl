@@ -3,7 +3,7 @@
 %%% Created :  2 Jun 2013 by Evgeniy Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -20,10 +20,7 @@
 %%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 %%%
 %%%----------------------------------------------------------------------
-
-
 -module(ejabberd_SUITE).
-
 -compile(export_all).
 
 -import(suite, [init_config/1, connect/1, disconnect/1, recv_message/1,
@@ -40,7 +37,7 @@
                 bind/1, auth/1, auth/2, open_session/1, open_session/2,
 		zlib/1, starttls/1, starttls/2, close_socket/1, init_stream/1,
 		auth_legacy/2, auth_legacy/3, tcp_connect/1, send_text/2,
-		set_roster/3, del_roster/1]).
+		set_roster/3, del_roster/1, connect_sasl2/2, auth_SASL2/3, auth_fast_token/4]).
 -include("suite.hrl").
 
 suite() ->
@@ -55,31 +52,33 @@ init_per_suite(Config) ->
     {ok, _} = file:copy(ExtAuthScript, filename:join([CWD, "extauth.py"])),
     {ok, _} = ldap_srv:start(LDIFFile),
     inet_db:add_host({127,0,0,1}, [binary_to_list(?S2S_VHOST),
-				   binary_to_list(?MNESIA_VHOST)]),
-    inet_db:set_domain(binary_to_list(randoms:get_string())),
+				   binary_to_list(?MNESIA_VHOST),
+				   binary_to_list(?UPLOAD_VHOST)]),
+    inet_db:set_domain(binary_to_list(p1_rand:get_string())),
     inet_db:set_lookup([file, native]),
     start_ejabberd(NewConfig),
     NewConfig.
 
-start_ejabberd(Config) ->
-    case proplists:get_value(backends, Config) of
-        all ->
-            ok = application:start(ejabberd, transient);
-        Backends when is_list(Backends) ->
-            Hosts = lists:map(fun(Backend) -> Backend ++ ".localhost" end, Backends),
-            application:load(ejabberd),
-            AllHosts = Hosts ++ ["localhost"],    %% We always need localhost for the generic no_db tests
-            application:set_env(ejabberd, hosts, AllHosts),
-            ok = application:start(ejabberd, transient)
-    end.
+start_ejabberd(_) ->
+    TestBeams = case filelib:is_dir("../../test/") of
+       true -> "../../test/";
+       _ -> "../../lib/ejabberd/test/"
+    end,
+    application:set_env(ejabberd, external_beams, TestBeams),
+    {ok, _} = application:ensure_all_started(ejabberd, transient).
+
 
 end_per_suite(_Config) ->
     application:stop(ejabberd).
 
--define(BACKENDS, [mnesia,redis,mysql,pgsql,sqlite,ldap,extauth,riak]).
-
 init_per_group(Group, Config) ->
-    case lists:member(Group, ?BACKENDS) of
+    BackendOfGroup = case Group of
+                         component -> agnostic;
+                         no_db -> agnostic;
+                         s2s -> agnostic;
+                         _ -> Group
+                     end,
+    case lists:member(BackendOfGroup, ?BACKENDS) of
         false ->
             %% Not a backend related group, do default init:
             do_init_per_group(Group, Config);
@@ -89,13 +88,13 @@ init_per_group(Group, Config) ->
                     %% All backends enabled
                     do_init_per_group(Group, Config);
                 Backends ->
-                    %% Skipped backends that were not explicitely enabled
-                    case lists:member(atom_to_list(Group), Backends) of
-                        true ->
-                            do_init_per_group(Group, Config);
-                        false ->
-                            {skip, {disabled_backend, Group}}
-                    end
+                    %% Skipped backends that were not explicitly enabled
+		    case lists:member(BackendOfGroup, Backends) of
+			true ->
+			    do_init_per_group(Group, Config);
+			false ->
+			    {skip, {disabled_backend, Group}}
+		    end
             end
     end.
 
@@ -112,16 +111,28 @@ do_init_per_group(mysql, Config) ->
     case catch ejabberd_sql:sql_query(?MYSQL_VHOST, [<<"select 1;">>]) of
         {selected, _, _} ->
             mod_muc:shutdown_rooms(?MYSQL_VHOST),
-            create_sql_tables(mysql, ?config(base_dir, Config)),
+            update_sql(?MYSQL_VHOST, Config),
+            stop_temporary_modules(?MYSQL_VHOST),
             set_opt(server, ?MYSQL_VHOST, Config);
         Err ->
             {skip, {mysql_not_available, Err}}
+    end;
+do_init_per_group(mssql, Config) ->
+    case catch ejabberd_sql:sql_query(?MSSQL_VHOST, [<<"select 1;">>]) of
+        {selected, _, _} ->
+            mod_muc:shutdown_rooms(?MSSQL_VHOST),
+            update_sql(?MSSQL_VHOST, Config),
+            stop_temporary_modules(?MSSQL_VHOST),
+            set_opt(server, ?MSSQL_VHOST, Config);
+        Err ->
+            {skip, {mssql_not_available, Err}}
     end;
 do_init_per_group(pgsql, Config) ->
     case catch ejabberd_sql:sql_query(?PGSQL_VHOST, [<<"select 1;">>]) of
         {selected, _, _} ->
             mod_muc:shutdown_rooms(?PGSQL_VHOST),
-            create_sql_tables(pgsql, ?config(base_dir, Config)),
+            update_sql(?PGSQL_VHOST, Config),
+            stop_temporary_modules(?PGSQL_VHOST),
             set_opt(server, ?PGSQL_VHOST, Config);
         Err ->
             {skip, {pgsql_not_available, Err}}
@@ -138,18 +149,9 @@ do_init_per_group(ldap, Config) ->
     set_opt(server, ?LDAP_VHOST, Config);
 do_init_per_group(extauth, Config) ->
     set_opt(server, ?EXTAUTH_VHOST, Config);
-do_init_per_group(riak, Config) ->
-    case ejabberd_riak:is_connected() of
-	true ->
-	    mod_muc:shutdown_rooms(?RIAK_VHOST),
-	    NewConfig = set_opt(server, ?RIAK_VHOST, Config),
-	    clear_riak_tables(NewConfig);
-	Err ->
-	    {skip, {riak_not_available, Err}}
-    end;
 do_init_per_group(s2s, Config) ->
-    ejabberd_config:add_option(s2s_use_starttls, required_trusted),
-    ejabberd_config:add_option(domain_certfile, "cert.pem"),
+    ejabberd_config:set_option({s2s_use_starttls, ?COMMON_VHOST}, required),
+    ejabberd_config:set_option(ca_file, "ca.pem"),
     Port = ?config(s2s_port, Config),
     set_opt(server, ?COMMON_VHOST,
 	    set_opt(xmlns, ?NS_SERVER,
@@ -174,13 +176,44 @@ do_init_per_group(GroupName, Config) ->
 	_ -> NewConfig
     end.
 
+stop_temporary_modules(Host) ->
+    Modules = [mod_shared_roster],
+    [gen_mod:stop_module(Host, M) || M <- Modules].
+
 end_per_group(mnesia, _Config) ->
     ok;
 end_per_group(redis, _Config) ->
     ok;
-end_per_group(mysql, _Config) ->
+end_per_group(mysql, Config) ->
+    Query = "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'mqtt_pub';",
+    case catch ejabberd_sql:sql_query(?MYSQL_VHOST, [Query]) of
+        {selected, _, [[<<"0">>]]} ->
+            ok;
+        {selected, _, _} ->
+            clear_sql_tables(mysql, Config);
+        Other ->
+            ct:fail({failed_to_check_table_existence, mysql, Other})
+    end,
     ok;
-end_per_group(pgsql, _Config) ->
+end_per_group(mssql, Config) ->
+    Query = "SELECT * FROM sys.tables WHERE name = 'mqtt_pub'",
+    case catch ejabberd_sql:sql_query(?MSSQL_VHOST, [Query]) of
+        {selected, [t]} ->
+            clear_sql_tables(mssql, Config);
+        Other ->
+            ct:fail({failed_to_check_table_existence, mssql, Other})
+    end,
+    ok;
+end_per_group(pgsql, Config) ->
+    Query = "SELECT EXISTS (SELECT 0 FROM information_schema.tables WHERE table_name = 'mqtt_pub');",
+    case catch ejabberd_sql:sql_query(?PGSQL_VHOST, [Query]) of
+        {selected, [t]} ->
+            clear_sql_tables(pgsql, Config);
+	{selected, _, [[<<"t">>]]} ->
+	    clear_sql_tables(pgsql, Config);
+        Other ->
+            ct:fail({failed_to_check_table_existence, pgsql, Other})
+    end,
     ok;
 end_per_group(sqlite, _Config) ->
     ok;
@@ -190,17 +223,11 @@ end_per_group(ldap, _Config) ->
     ok;
 end_per_group(extauth, _Config) ->
     ok;
-end_per_group(riak, Config) ->
-    case ejabberd_riak:is_connected() of
-	true ->
-	    clear_riak_tables(Config);
-	false ->
-	    Config
-    end;
 end_per_group(component, _Config) ->
     ok;
-end_per_group(s2s, _Config) ->
-    ejabberd_config:add_option(s2s_use_starttls, false);
+end_per_group(s2s, Config) ->
+    Server = ?config(server, Config),
+    ejabberd_config:set_option({s2s_use_starttls, Server}, false);
 end_per_group(_GroupName, Config) ->
     stop_event_relay(Config),
     set_opt(anonymous, false, Config).
@@ -210,9 +237,10 @@ init_per_testcase(stop_ejabberd, Config) ->
 			set_opt(anonymous, true, Config)),
     open_session(bind(auth(connect(NewConfig))));
 init_per_testcase(TestCase, OrigConfig) ->
+    ct:print(80, "Testcase '~p' starting", [TestCase]),
     Test = atom_to_list(TestCase),
-    IsMaster = lists:suffix("_master", Test),
-    IsSlave = lists:suffix("_slave", Test),
+    IsMaster = lists:suffix("_romeo", Test) orelse lists:suffix("_master", Test),
+    IsSlave = lists:suffix("_julia", Test) orelse lists:suffix("_slave", Test),
     if IsMaster or IsSlave ->
 	    subscribe_to_events(OrigConfig);
        true ->
@@ -225,7 +253,7 @@ init_per_testcase(TestCase, OrigConfig) ->
 		   anonymous ->
 		       <<"">>;
 		   legacy_auth ->
-		       randoms:get_string();
+		       p1_rand:get_string();
 		   _ ->
 		       ?config(resource, OrigConfig)
 	       end,
@@ -286,6 +314,8 @@ init_per_testcase(TestCase, OrigConfig) ->
     case Test of
         "test_connect" ++ _ ->
             Config;
+        "webadmin_" ++ _ ->
+            Config;
 	"test_legacy_auth_feature" ->
 	    connect(Config);
 	"test_legacy_auth" ++ _ ->
@@ -295,13 +325,20 @@ init_per_testcase(TestCase, OrigConfig) ->
         "test_starttls" ++ _ ->
             connect(Config);
         "test_zlib" ->
-            connect(Config);
+            auth(connect(starttls(connect(Config))));
         "test_register" ->
             connect(Config);
         "auth_md5" ->
             connect(Config);
+        "auth_md5_wrong_authzid" ->
+            connect(Config);
         "auth_plain" ->
             connect(Config);
+        "auth_plain_wrong_authzid" ->
+            connect(Config);
+	"auth_sasl2" ->
+	    Jid = jid:encode(jid:make(User, Server)),
+	    connect_sasl2(starttls(connect_sasl2(Config, Jid)), Jid);
 	"auth_external" ++ _ ->
 	    connect(Config);
 	"unauthenticated_" ++ _ ->
@@ -316,18 +353,30 @@ init_per_testcase(TestCase, OrigConfig) ->
             bind(auth(connect(Config)));
 	"replaced" ++ _ ->
 	    auth(connect(Config));
-        _ when IsMaster or IsSlave ->
-            Password = ?config(password, Config),
-            ejabberd_auth:try_register(User, Server, Password),
-            open_session(bind(auth(connect(Config))));
+	"sqlschemaupdater_" ++ _ ->
+	    Config;
+	"dbserializer_" ++ _ ->
+	    Config;
 	_ when TestGroup == s2s_tests ->
 	    auth(connect(starttls(connect(Config))));
         _ ->
+            Password = ?config(password, Config),
+            ejabberd_auth:try_register(User, Server, Password),
             open_session(bind(auth(connect(Config))))
     end.
 
-end_per_testcase(_TestCase, _Config) ->
-    ok.
+end_per_testcase(TestCase, Config) ->
+    case atom_to_list(TestCase) of
+        "invites_" ++ _ ->
+            User = ?config(user, Config),
+            Server = ?config(server, Config),
+            mod_offline:remove_user(User, Server);
+	"dbserializer_" ++ Test ->
+	    Clean = list_to_atom(Test ++ "_clean"),
+	    dbserializer_tests:Clean(Config);
+        _ ->
+            ok
+    end.
 
 legacy_auth_tests() ->
     {legacy_auth, [parallel],
@@ -353,15 +402,14 @@ no_db_tests() ->
        unauthenticated_message,
        unauthenticated_presence,
        test_starttls,
-       test_zlib,
        test_auth,
+       test_zlib,
        test_bind,
        test_open_session,
        codec_failure,
        unsupported_query,
        bad_nonza,
        invalid_from,
-       legacy_iq,
        ping,
        version,
        time,
@@ -372,8 +420,7 @@ no_db_tests() ->
        presence,
        s2s_dialback,
        s2s_optional,
-       s2s_required,
-       s2s_required_trusted]},
+       s2s_required]},
      auth_external,
      auth_external_no_jid,
      auth_external_no_user,
@@ -381,95 +428,104 @@ no_db_tests() ->
      auth_external_wrong_jid,
      auth_external_wrong_server,
      auth_external_invalid_cert,
+     commands_tests:single_cases(),
+     configtest_tests:single_cases(),
+     jidprep_tests:single_cases(),
      sm_tests:single_cases(),
      sm_tests:master_slave_cases(),
      muc_tests:single_cases(),
      muc_tests:master_slave_cases(),
      proxy65_tests:single_cases(),
      proxy65_tests:master_slave_cases(),
-     replaced_tests:master_slave_cases()].
+     stundisco_tests:single_cases(),
+     replaced_tests:master_slave_cases(),
+     upload_tests:single_cases(),
+     carbons_tests:single_cases(),
+     carbons_tests:master_slave_cases(),
+     sip_tests:single_cases(),
+     sip_tests:master_slave_cases()].
 
-db_tests(riak) ->
-    %% No support for mod_pubsub
-    [{single_user, [sequence],
-      [test_register,
-       legacy_auth_tests(),
-       auth_plain,
-       auth_md5,
-       presence_broadcast,
-       last,
-       roster_tests:single_cases(),
-       private,
-       privacy_tests:single_cases(),
-       vcard_tests:single_cases(),
-       muc_tests:single_cases(),
-       offline_tests:single_cases(),
-       carbons_tests:single_cases(),
-       test_unregister]},
-     muc_tests:master_slave_cases(),
-     privacy_tests:master_slave_cases(),
-     roster_tests:master_slave_cases(),
-     offline_tests:master_slave_cases(),
-     vcard_tests:master_slave_cases(),
-     announce_tests:master_slave_cases(),
-     carbons_tests:master_slave_cases()];
 db_tests(DB) when DB == mnesia; DB == redis ->
     [{single_user, [sequence],
       [test_register,
        legacy_auth_tests(),
        auth_plain,
+       auth_plain_wrong_authzid,
+       auth_sasl2,
        auth_md5,
+       auth_md5_wrong_authzid,
        presence_broadcast,
+       caps_stuffing_bug,
        last,
+       antispam_tests:single_cases(),
+       antispam_report_tests:single_cases(),
+       webadmin_tests:single_cases(),
        roster_tests:single_cases(),
-       private,
+       private_tests:single_cases(),
        privacy_tests:single_cases(),
        vcard_tests:single_cases(),
        pubsub_tests:single_cases(),
        muc_tests:single_cases(),
        offline_tests:single_cases(),
+       invites_tests:single_cases(),
        mam_tests:single_cases(),
-       carbons_tests:single_cases(),
        csi_tests:single_cases(),
        push_tests:single_cases(),
+       dbserializer_tests:single_cases(),
+       test_pass_change,
        test_unregister]},
+     antispam_report_tests:couple_cases(),
      muc_tests:master_slave_cases(),
      privacy_tests:master_slave_cases(),
      pubsub_tests:master_slave_cases(),
      roster_tests:master_slave_cases(),
-     offline_tests:master_slave_cases(),
+     offline_tests:master_slave_cases(DB),
      mam_tests:master_slave_cases(),
      vcard_tests:master_slave_cases(),
      announce_tests:master_slave_cases(),
-     carbons_tests:master_slave_cases(),
      csi_tests:master_slave_cases(),
      push_tests:master_slave_cases()];
-db_tests(_) ->
+db_tests(DB) ->
+    SqlUpdate = if
+		    DB == sqlite; DB == mysql; DB == pgsql; DB == mssql ->
+			[sqlschemaupdater_tests:single_cases()];
+		    true -> []
+		end,
     [{single_user, [sequence],
       [test_register,
        legacy_auth_tests(),
        auth_plain,
+       auth_plain_wrong_authzid,
+       auth_sasl2,
        auth_md5,
+       auth_md5_wrong_authzid,
        presence_broadcast,
+       caps_stuffing_bug,
        last,
+       webadmin_tests:single_cases(),
        roster_tests:single_cases(),
-       private,
+       private_tests:single_cases(),
        privacy_tests:single_cases(),
        vcard_tests:single_cases(),
        pubsub_tests:single_cases(),
        muc_tests:single_cases(),
        offline_tests:single_cases(),
        mam_tests:single_cases(),
-       test_unregister]},
+       push_tests:single_cases(),
+       invites_tests:single_cases(),
+       dbserializer_tests:single_cases(),
+       test_pass_change,
+       test_unregister] ++ SqlUpdate},
+     antispam_report_tests:couple_cases(),
      muc_tests:master_slave_cases(),
      privacy_tests:master_slave_cases(),
      pubsub_tests:master_slave_cases(),
      roster_tests:master_slave_cases(),
-     offline_tests:master_slave_cases(),
+     offline_tests:master_slave_cases(DB),
      mam_tests:master_slave_cases(),
      vcard_tests:master_slave_cases(),
      announce_tests:master_slave_cases(),
-     carbons_tests:master_slave_cases()].
+     push_tests:master_slave_cases()].
 
 ldap_tests() ->
     [{ldap_tests, [sequence],
@@ -531,9 +587,9 @@ groups() ->
      {mnesia, [sequence], db_tests(mnesia)},
      {redis, [sequence], db_tests(redis)},
      {mysql, [sequence], db_tests(mysql)},
+     {mssql, [sequence], db_tests(mssql)},
      {pgsql, [sequence], db_tests(pgsql)},
-     {sqlite, [sequence], db_tests(sqlite)},
-     {riak, [sequence], db_tests(riak)}].
+     {sqlite, [sequence], db_tests(sqlite)}].
 
 all() ->
     [{group, ldap},
@@ -541,10 +597,10 @@ all() ->
      {group, mnesia},
      {group, redis},
      {group, mysql},
+     {group, mssql},
      {group, pgsql},
      {group, sqlite},
      {group, extauth},
-     {group, riak},
      {group, component},
      {group, s2s},
      stop_ejabberd].
@@ -552,7 +608,14 @@ all() ->
 stop_ejabberd(Config) ->
     ok = application:stop(ejabberd),
     ?recv1(#stream_error{reason = 'system-shutdown'}),
-    ?recv1({xmlstreamend, <<"stream:stream">>}),
+    case suite:recv(Config) of
+        {xmlstreamend, <<"stream:stream">>} ->
+            ok;
+        closed ->
+            ok;
+        Other ->
+            suite:match_failure([Other], [closed])
+    end,
     Config.
 
 test_connect_bad_xml(Config) ->
@@ -598,7 +661,7 @@ test_connect_bad_ns_stream(Config) ->
 test_connect_bad_lang(Config) ->
     Lang = iolist_to_binary(lists:duplicate(36, $x)),
     Config0 = init_stream(set_opt(lang, Lang, Config)),
-    ?recv1(#stream_error{reason = 'policy-violation'}),
+    ?recv1(#stream_error{reason = 'invalid-xml'}),
     ?recv1({xmlstreamend, <<"stream:stream">>}),
     close_socket(Config0).
 
@@ -671,6 +734,25 @@ register(Config) ->
                                    password = ?config(password, Config)}]}),
     Config.
 
+test_pass_change(Config) ->
+    case ?config(register, Config) of
+	true ->
+	    #iq{type = result, sub_els = []} =
+		send_recv(
+		    Config,
+		    #iq{type = set,
+			sub_els = [#register{username = ?config(user, Config),
+					     password = ?config(password, Config)}]}),
+	    #iq{type = result, sub_els = []} =
+		send_recv(
+		    Config,
+		    #iq{type = set,
+			sub_els = [#register{username = str:to_upper(?config(user, Config)),
+					     password = ?config(password, Config)}]});
+	_ ->
+	    {skipped, 'registration_not_available'}
+    end.
+
 test_unregister(Config) ->
     case ?config(register, Config) of
         true ->
@@ -714,7 +796,7 @@ bad_nonza(Config) ->
     disconnect(Config).
 
 invalid_from(Config) ->
-    send(Config, #message{from = jid:make(randoms:get_string())}),
+    send(Config, #message{from = jid:make(p1_rand:get_string())}),
     ?recv1(#stream_error{reason = 'invalid-from'}),
     ?recv1({xmlstreamend, <<"stream:stream">>}),
     close_socket(Config).
@@ -734,8 +816,8 @@ test_missing_to(Config) ->
     close_socket(Config).
 
 test_invalid_from(Config) ->
-    From = jid:make(randoms:get_string()),
-    To = jid:make(randoms:get_string()),
+    From = jid:make(p1_rand:get_string()),
+    To = jid:make(p1_rand:get_string()),
     send(Config, #message{from = From, to = To}),
     ?recv1(#stream_error{reason = 'invalid-from'}),
     ?recv1({xmlstreamend, <<"stream:stream">>}),
@@ -750,33 +832,35 @@ test_component_send(Config) ->
     disconnect(Config).
 
 s2s_dialback(Config) ->
+    Server = ?config(server, Config),
     ejabberd_s2s:stop_s2s_connections(),
-    ejabberd_config:add_option(s2s_use_starttls, false),
-    ejabberd_config:add_option(domain_certfile, "self-signed-cert.pem"),
+    ejabberd_config:set_option({s2s_use_starttls, Server}, false),
+    ejabberd_config:set_option({s2s_use_starttls, ?MNESIA_VHOST}, false),
+    ejabberd_config:set_option(ca_file, pkix:get_cafile()),
     s2s_ping(Config).
 
 s2s_optional(Config) ->
+    Server = ?config(server, Config),
     ejabberd_s2s:stop_s2s_connections(),
-    ejabberd_config:add_option(s2s_use_starttls, optional),
-    ejabberd_config:add_option(domain_certfile, "self-signed-cert.pem"),
+    ejabberd_config:set_option({s2s_use_starttls, Server}, optional),
+    ejabberd_config:set_option({s2s_use_starttls, ?MNESIA_VHOST}, optional),
+    ejabberd_config:set_option(ca_file, pkix:get_cafile()),
     s2s_ping(Config).
 
 s2s_required(Config) ->
+    Server = ?config(server, Config),
     ejabberd_s2s:stop_s2s_connections(),
-    ejabberd_config:add_option(s2s_use_starttls, required),
-    ejabberd_config:add_option(domain_certfile, "self-signed-cert.pem"),
-    s2s_ping(Config).
-
-s2s_required_trusted(Config) ->
-    ejabberd_s2s:stop_s2s_connections(),
-    ejabberd_config:add_option(s2s_use_starttls, required),
-    ejabberd_config:add_option(domain_certfile, "cert.pem"),
+    gen_mod:stop_module(Server, mod_s2s_dialback),
+    gen_mod:stop_module(?MNESIA_VHOST, mod_s2s_dialback),
+    ejabberd_config:set_option({s2s_use_starttls, Server}, required),
+    ejabberd_config:set_option({s2s_use_starttls, ?MNESIA_VHOST}, required),
+    ejabberd_config:set_option(ca_file, "ca.pem"),
     s2s_ping(Config).
 
 s2s_ping(Config) ->
     From = my_jid(Config),
     To = jid:make(?MNESIA_VHOST),
-    ID = randoms:get_string(),
+    ID = p1_rand:get_string(),
     ejabberd_s2s:route(#iq{from = From, to = To, id = ID,
 			   type = get, sub_els = [#ping{}]}),
     #iq{type = result, id = ID, sub_els = []} = recv_iq(Config),
@@ -792,6 +876,19 @@ auth_md5(Config) ->
             {skipped, 'DIGEST-MD5_not_available'}
     end.
 
+auth_md5_wrong_authzid(Config) ->
+    Mechs = ?config(mechs, Config),
+    case lists:member(<<"DIGEST-MD5">>, Mechs) of
+        true ->
+            AZ = <<"fake@", (?config(server, Config))/binary>>,
+            Config2 = set_opt(authzid, AZ, Config),
+            Config3 = disconnect(auth_SASL(<<"DIGEST-MD5">>, Config2, true)),
+            set_opt(authzid, <<>>, Config3);
+        false ->
+            disconnect(Config),
+            {skipped, 'DIGEST-MD5_not_available'}
+    end.
+
 auth_plain(Config) ->
     Mechs = ?config(mechs, Config),
     case lists:member(<<"PLAIN">>, Mechs) of
@@ -800,6 +897,44 @@ auth_plain(Config) ->
         false ->
             disconnect(Config),
             {skipped, 'PLAIN_not_available'}
+    end.
+
+auth_plain_wrong_authzid(Config) ->
+    Mechs = ?config(mechs, Config),
+    case lists:member(<<"PLAIN">>, Mechs) of
+        true ->
+            AZ = <<"fake@", (?config(server, Config))/binary>>,
+            Config2 = set_opt(authzid, AZ, Config),
+            Config3 = disconnect(auth_SASL(<<"PLAIN">>, Config2, true)),
+            set_opt(authzid, <<>>, Config3);
+        false ->
+            disconnect(Config),
+            {skipped, 'PLAIN_not_available'}
+    end.
+
+auth_sasl2(Config) ->
+    Mechs = ?config(mechs, Config),
+    case lists:member(<<"DIGEST-MD5">>, Mechs) of
+	true ->
+	    Config2 = disconnect(auth_SASL2(<<"DIGEST-MD5">>, Config, false)),
+	    case ?config(fast_token, Config2) of
+		<<>> -> Config2;
+		Token ->
+		    User = ?config(user, Config),
+		    Jid = jid:encode(jid:make(User, ?config(server, Config))),
+		    Hash = crypto:mac(hmac, sha256, Token, <<"Initiator">>),
+		    CalcToken = (<<User/binary, 0, Hash/binary>>),
+		    Config3 = connect_sasl2(starttls(connect_sasl2(Config2, Jid)), Jid),
+		    Config4 = disconnect(auth_fast_token(<<"HT-SHA-256-NONE">>, CalcToken, Config3, false)),
+		    Config5 = connect_sasl2(starttls(connect_sasl2(Config4, Jid)), Jid),
+       	    {ok, CB} = suite:recv_call(Config5, get_cb),
+		    Hash2 = crypto:mac(hmac, sha256, Token, <<"Initiator", CB/binary>>),
+		    CalcToken2 = (<<User/binary, 0, Hash2/binary>>),
+		    disconnect(auth_fast_token(<<"HT-SHA-256-ENDP">>, CalcToken2, Config5, true))
+	    end;
+	false ->
+	    disconnect(Config),
+	    {skipped, 'DIGEST-MD5_not_available'}
     end.
 
 auth_external(Config0) ->
@@ -897,13 +1032,12 @@ presence(Config) ->
     disconnect(Config).
 
 presence_broadcast(Config) ->
-    Feature = <<"p1:tmp:", (randoms:get_string())/binary>>,
+    Feature = <<"p1:tmp:", (p1_rand:get_string())/binary>>,
     Ver = crypto:hash(sha, ["client", $/, "bot", $/, "en", $/,
                             "ejabberd_ct", $<, Feature, $<]),
     B64Ver = base64:encode(Ver),
     Node = <<(?EJABBERD_CT_URI)/binary, $#, B64Ver/binary>>,
     Server = ?config(server, Config),
-    ServerJID = server_jid(Config),
     Info = #disco_info{identities =
 			   [#identity{category = <<"client">>,
 				      type = <<"bot">>,
@@ -918,12 +1052,13 @@ presence_broadcast(Config) ->
     %% 2) welcome message
     %% 3) presence broadcast
     IQ = #iq{type = get,
-	     from = ServerJID,
+	     from = JID,
 	     sub_els = [#disco_info{node = Node}]} = recv_iq(Config),
-    #message{type = normal} = recv_message(Config),
+    #message{type = chat,
+             subject = [#text{lang = <<"en">>,data = <<"Welcome!">>}]} = recv_message(Config),
     #presence{from = JID, to = JID} = recv_presence(Config),
     send(Config, #iq{type = result, id = IQ#iq.id,
-		     to = ServerJID, sub_els = [Info]}),
+		     to = JID, sub_els = [Info]}),
     %% We're trying to read our feature from ejabberd database
     %% with exponential back-off as our IQ response may be delayed.
     [Feature] =
@@ -936,12 +1071,49 @@ presence_broadcast(Config) ->
 	  end, [], [0, 100, 200, 2000, 5000, 10000]),
     disconnect(Config).
 
-legacy_iq(Config) ->
-    true = is_feature_advertised(Config, ?NS_EVENT),
-    ServerJID = server_jid(Config),
-    #iq{type = result, sub_els = []} =
-	send_recv(Config, #iq{to = ServerJID, type = get,
-			      sub_els = [#xevent{}]}),
+caps_stuffing_bug(Config) ->
+    Feature = <<"p1:tmp:", (p1_rand:get_string())/binary>>,
+    Ver = crypto:hash(sha, ["client", $/, "bot", $/, "en", $/,
+                            "ejabberd_ct", $<, Feature, $<]),
+    B64Ver = base64:encode(Ver),
+    Node = <<(?EJABBERD_CT_URI)/binary, $#, B64Ver/binary>>,
+    Server = ?config(server, Config),
+    Info = #disco_info{identities =
+			   [#identity{category = <<"client">>,
+				      type = <<"bot">>,
+				      lang = <<"en">>,
+				      name = <<"ejabberd_ct">>}],
+		       node = Node, features = [Feature]},
+    BadInfo = Info#disco_info{features = [Feature, <<"p1:bad:feature">>]},
+    Caps = #caps{hash = <<"sha-1">>, node = ?EJABBERD_CT_URI, version = B64Ver},
+    BadCaps = Caps#caps{hash = <<>>},
+    send(Config, #presence{sub_els = [BadCaps]}),
+    JID = my_jid(Config),
+    IQ = #iq{type = get,
+	     from = JID,
+	     sub_els = [#disco_info{node = Node}]} = recv_iq(Config),
+    %% #message{type = chat,
+    %%          subject = [#text{lang = <<"en">>,data = <<"Welcome!">>}]} = recv_message(Config),
+    #presence{from = JID, to = JID} = recv_presence(Config),
+    send(Config, #iq{type = result, id = IQ#iq.id,
+		     to = JID, sub_els = [BadInfo]}),
+    send(Config, #presence{sub_els = [Caps]}),
+    receive #iq{} = IQ2 ->
+        send(Config, #iq{type = result, id = IQ2#iq.id,
+    		     to = JID, sub_els = [Info]})
+        after 2000 ->
+            ok
+    end,
+    #presence{from = JID, to = JID} = recv_presence(Config),
+    RetrievedCaps =
+	lists:foldl(
+	  fun(Time, []) ->
+		  timer:sleep(Time),
+		  mod_caps:get_features(Server, Caps);
+	     (_, Acc) ->
+		  Acc
+	  end, [], [0, 100, 200, 2000, 5000, 10000]),
+    ?match([Feature], RetrievedCaps),
     disconnect(Config).
 
 ping(Config) ->
@@ -981,33 +1153,6 @@ disco(Config) ->
                             #iq{type = get, to = JID,
                                 sub_els = [#disco_info{node = Node}]})
       end, Items),
-    disconnect(Config).
-
-private(Config) ->
-    Conference = #bookmark_conference{name = <<"Some name">>,
-                                      autojoin = true,
-                                      jid = jid:make(
-                                              <<"some">>,
-                                              <<"some.conference.org">>,
-                                              <<>>)},
-    Storage = #bookmark_storage{conference = [Conference]},
-    StorageXMLOut = xmpp:encode(Storage),
-    WrongEl = #xmlel{name = <<"wrong">>},
-    #iq{type = error} =
-        send_recv(Config, #iq{type = get,
-			      sub_els = [#private{xml_els = [WrongEl]}]}),
-    #iq{type = result, sub_els = []} =
-        send_recv(
-          Config, #iq{type = set,
-                      sub_els = [#private{xml_els = [WrongEl, StorageXMLOut]}]}),
-    #iq{type = result,
-        sub_els = [#private{xml_els = [StorageXMLIn]}]} =
-        send_recv(
-          Config,
-          #iq{type = get,
-              sub_els = [#private{xml_els = [xmpp:encode(
-                                               #bookmark_storage{})]}]}),
-    Storage = xmpp:decode(StorageXMLIn),
     disconnect(Config).
 
 last(Config) ->
@@ -1056,7 +1201,7 @@ bookmark_conference() ->
                                  <<>>)}.
 
 '$handle_undefined_function'(F, [Config]) when is_list(Config) ->
-    case re:split(atom_to_list(F), "_", [{return, list}, {parts, 2}]) of
+    case split_function_name(F) of
 	[M, T] ->
 	    Module = list_to_atom(M ++ "_tests"),
 	    Function = list_to_atom(T),
@@ -1072,27 +1217,50 @@ bookmark_conference() ->
 '$handle_undefined_function'(_, _) ->
     erlang:error(undef).
 
+split_function_name(F) ->
+    case re:split(atom_to_list(F), "\\.", [{return, list}, {parts, 2}]) of
+        Res when length(Res) == 2 -> Res;
+        _ -> re:split(atom_to_list(F), "_", [{return, list}, {parts, 2}])
+    end.
+
 %%%===================================================================
 %%% SQL stuff
 %%%===================================================================
-create_sql_tables(sqlite, _BaseDir) ->
+update_sql(Host, Config) ->
+    case ?config(update_sql, Config) of
+        true ->
+            mod_admin_update_sql:update_sql(Host);
+        false -> ok
+    end.
+
+schema_suffix(Config) ->
+    case ejabberd_sql:use_multihost_schema() of
+        true ->
+            case ?config(update_sql, Config) of
+                true ->  ".sql";
+                _ -> ".new.sql"
+            end;
+        _ -> ".sql"
+    end.
+
+clear_sql_tables(sqlite, _Config) ->
     ok;
-create_sql_tables(Type, BaseDir) ->
+clear_sql_tables(Type, Config) ->
+    BaseDir = ?config(base_dir, Config),
     {VHost, File} = case Type of
-                        mysql ->
-                            {?MYSQL_VHOST, "mysql.sql"};
-                        pgsql ->
-                            {?PGSQL_VHOST, "pg.sql"}
+                        mysql -> {?MYSQL_VHOST, "mysql" ++ schema_suffix(Config)};
+                        mssql -> {?MSSQL_VHOST, "mssql" ++ schema_suffix(Config)};
+                        pgsql -> {?PGSQL_VHOST, "pg" ++ schema_suffix(Config)}
                     end,
     SQLFile = filename:join([BaseDir, "sql", File]),
     CreationQueries = read_sql_queries(SQLFile),
-    DropTableQueries = drop_table_queries(CreationQueries),
+    ClearTableQueries = clear_table_queries(CreationQueries),
     case ejabberd_sql:sql_transaction(
-           VHost, DropTableQueries ++ CreationQueries) of
+           VHost, ClearTableQueries) of
         {atomic, ok} ->
             ok;
         Err ->
-            ct:fail({failed_to_create_sql_tables, Type, Err})
+            ct:fail({failed_to_clear_sql_tables, Type, Err})
     end.
 
 read_sql_queries(File) ->
@@ -1103,12 +1271,22 @@ read_sql_queries(File) ->
             ct:fail({open_file_failed, File, Err})
     end.
 
-drop_table_queries(Queries) ->
+clear_table_queries(Queries) ->
     lists:foldl(
       fun(Query, Acc) ->
               case split(str:to_lower(Query)) of
                   [<<"create">>, <<"table">>, Table|_] ->
-                      [<<"DROP TABLE IF EXISTS ", Table/binary, ";">>|Acc];
+                      GlobalRamTables = [<<"bosh">>,
+                                         <<"oauth_client">>,
+                                         <<"oauth_token">>,
+                                         <<"proxy65">>,
+                                         <<"route">>],
+                      case lists:member(Table, GlobalRamTables) of
+                          true ->
+                              Acc;
+                          false ->
+                              [<<"DELETE FROM ", Table/binary, ";">>|Acc]
+                      end;
                   _ ->
                       Acc
               end
@@ -1149,15 +1327,22 @@ split(Data) ->
               true
       end, re:split(Data, <<"\s">>)).
 
-clear_riak_tables(Config) ->
-    User = ?config(user, Config),
-    Server = ?config(server, Config),
-    Master = <<"test_master!#$%^*()`~+-;_=[]{}|\\">>,
-    Slave = <<"test_slave!#$%^*()`~+-;_=[]{}|\\">>,
-    ejabberd_auth:remove_user(User, Server),
-    ejabberd_auth:remove_user(Master, Server),
-    ejabberd_auth:remove_user(Slave, Server),
-    ejabberd_riak:delete(muc_room),
-    ejabberd_riak:delete(muc_registered),
-    timer:sleep(timer:seconds(5)),
-    Config.
+%%%===================================================================
+%%% SIP test wrappers (for GHSA-8j9p-hpfg-5cg3 security fixes)
+%%% These delegate to sip_tests module
+%%%===================================================================
+sip_reject_multiple_from_headers(Config) ->
+    sip_tests:sip_reject_multiple_from_headers(Config).
+
+sip_reject_multiple_to_headers(Config) ->
+    sip_tests:sip_reject_multiple_to_headers(Config).
+
+sip_reject_missing_from_header(Config) ->
+    sip_tests:sip_reject_missing_from_header(Config).
+
+sip_reject_missing_to_header(Config) ->
+    sip_tests:sip_reject_missing_to_header(Config).
+
+
+sip_require_auth_external_to_local(Config) ->
+    sip_tests:sip_require_auth_external_to_local(Config).

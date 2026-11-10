@@ -3,7 +3,7 @@
 %%% Created : 18 Oct 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2026   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -31,6 +31,7 @@
 		set_roster/3, del_roster/1, get_roster/1]).
 -include("suite.hrl").
 -include("mod_roster.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %%%===================================================================
 %%% API
@@ -59,12 +60,14 @@ single_cases() ->
       single_test(malformed_get),
       single_test(malformed_set),
       single_test(malformed_type_value),
-      single_test(set_get_block)]}.
+      single_test(set_get_block),
+      single_test(handle_report)]}.
 
 feature_enabled(Config) ->
     Features = get_features(Config),
     true = lists:member(?NS_PRIVACY, Features),
     true = lists:member(?NS_BLOCKING, Features),
+    true = lists:member(?NS_REPORTING_1, Features),
     disconnect(Config).
 
 set_get_list(Config) ->
@@ -202,7 +205,8 @@ malformed_iq_query(Config) ->
     disconnect(Config).
 
 malformed_get(Config) ->
-    JID = jid:make(randoms:get_string()),
+    JID = jid:make(p1_rand:get_string()),
+    Item = #block_item{jid = JID},
     lists:foreach(
       fun(SubEl) ->
 	      #iq{type = error} =
@@ -211,8 +215,10 @@ malformed_get(Config) ->
 	    #privacy_query{default = none},
 	    #privacy_query{lists = [#privacy_list{name = <<"1">>},
 				    #privacy_list{name = <<"2">>}]},
-	    #block{items = [JID]}, #unblock{items = [JID]},
-	    #block{}, #unblock{}]),
+	    #block{items = [Item]},
+            #unblock{items = [Item]},
+	    #block{},
+            #unblock{}]),
     disconnect(Config).
 
 malformed_set(Config) ->
@@ -225,7 +231,9 @@ malformed_set(Config) ->
 				    #privacy_list{name = <<"2">>}]},
 	    #block{},
 	    #block_list{},
-	    #block_list{items = [jid:make(randoms:get_string())]}]),
+	    #block_list{
+	       items = [#block_item{
+			   jid = jid:make(p1_rand:get_string())}]}]),
     disconnect(Config).
 
 malformed_type_value(Config) ->
@@ -242,13 +250,29 @@ malformed_type_value(Config) ->
     disconnect(Config).
 
 set_get_block(Config) ->
-    J1 = jid:make(randoms:get_string(), randoms:get_string()),
-    J2 = jid:make(randoms:get_string(), randoms:get_string()),
+    J1 = jid:make(p1_rand:get_string(), p1_rand:get_string()),
+    J2 = jid:make(p1_rand:get_string(), p1_rand:get_string()),
     {ok, ListName} = set_block(Config, [J1, J2]),
     JIDs = get_block(Config),
     JIDs = lists:sort([J1, J2]),
     {ok, ListName} = set_unblock(Config, [J2, J1]),
     [] = get_block(Config),
+    del_privacy(disconnect(Config)).
+
+handle_report(Config) ->
+    meck:new(ejabberd_hooks, [passthrough]),
+    meck:expect(ejabberd_hooks, run, fun(Hook, Host, Args) -> meck:passthrough([Hook, Host, Args]) end),
+    JID = jid:make(p1_rand:get_string(), p1_rand:get_string()),
+    Items = [#block_item{jid = JID, spam_report = #report{reason = spam}}],
+    #iq{type = result} =
+        send_recv(Config, #iq{type = set,
+                              sub_els = [#block{items = Items}]}),
+    {#iq{sub_els = [#block{items = _Items1}]},
+     #iq{sub_els = [#privacy_query{lists = _Lists}]}} =
+        ?recv2(#iq{type = set, sub_els = [#block{}]},
+               #iq{type = set, sub_els = [#privacy_query{}]}),
+    ?assertMatch([ok], [ok || {_, {ejabberd_hooks, run, [spam_reported, _, _]}, _} <- meck:history(ejabberd_hooks)]),
+    meck:unload([ejabberd_hooks]),
     del_privacy(disconnect(Config)).
 
 %%%===================================================================
@@ -301,29 +325,37 @@ deny_server_full_jid_slave(Config) ->
     deny_slave(Config).
 
 deny_group_master(Config) ->
-    Group = randoms:get_string(),
+    Group = p1_rand:get_string(),
     deny_master(Config, {group, Group}).
 
 deny_group_slave(Config) ->
-    deny_slave(Config).
+    %% [FIXME] needed to make https://github.com/processone/ejabberd/pull/4512 work, but unclear why
+    case ?config(server, Config) of
+	<<"mnesia", _/binary>> ->
+	    deny_slave(Config, 2);
+	<<"redis", _/binary>> ->
+	    deny_slave(Config, 2);
+	_ ->
+	    deny_slave(Config)
+    end.
 
 deny_sub_both_master(Config) ->
     deny_master(Config, {subscription, <<"both">>}).
 
 deny_sub_both_slave(Config) ->
-    deny_slave(Config).
+    deny_slave(Config, 2).
 
 deny_sub_from_master(Config) ->
     deny_master(Config, {subscription, <<"from">>}).
 
 deny_sub_from_slave(Config) ->
-    deny_slave(Config).
+    deny_slave(Config, 2).
 
 deny_sub_to_master(Config) ->
     deny_master(Config, {subscription, <<"to">>}).
 
 deny_sub_to_slave(Config) ->
-    deny_slave(Config).
+    deny_slave(Config, 2).
 
 deny_sub_none_master(Config) ->
     deny_master(Config, {subscription, <<"none">>}).
@@ -350,7 +382,7 @@ deny_master(Config, {Type, Value}) ->
     lists:foreach(
       fun(Opts) ->
 	      ct:pal("Set list for ~s, ~s, ~w", [Type, Value, Opts]),
-	      ListName = randoms:get_string(),
+	      ListName = p1_rand:get_string(),
 	      Item = #privacy_item{order = 0,
 				   action = deny,
 				   iq = proplists:get_bool(iq, Opts),
@@ -389,7 +421,8 @@ deny_master(Config, {Type, Value}) ->
 		  false -> send_messages(Config)
 	      end,
 	      case is_other_blocked(Opts) of
-		  true -> check_other_blocked(Config, 'not-acceptable');
+		  true ->
+		      check_other_blocked(Config, 'not-acceptable', Value, Type);
 		  false -> ok
 	      end,
 	      ct:comment("Waiting for slave to finish processing our stanzas"),
@@ -401,12 +434,16 @@ deny_master(Config, {Type, Value}) ->
     clean_up(disconnect(Config)).
 
 deny_slave(Config) ->
-    set_roster(Config, both, []),
-    deny_slave(Config, get_event(Config)).
+    deny_slave(Config, 0).
 
-deny_slave(Config, disconnect) ->
+deny_slave(Config, RosterPushesCount) ->
+    set_roster(Config, both, []),
+    deny_slave(Config, RosterPushesCount, get_event(Config)).
+
+deny_slave(Config, RosterPushesCount, disconnect) ->
+    recv_roster_pushes(Config, RosterPushesCount),
     clean_up(disconnect(Config));
-deny_slave(Config, Opts) ->
+deny_slave(Config, RosterPushesCount, Opts) ->
     send_presences(Config),
     case is_iq_in_blocked(Opts) of
 	true -> check_iq_blocked(Config, 'service-unavailable');
@@ -426,7 +463,7 @@ deny_slave(Config, Opts) ->
 	false -> recv_messages(Config)
     end,
     put_event(Config, done),
-    deny_slave(Config, get_event(Config)).
+    deny_slave(Config, RosterPushesCount, get_event(Config)).
 
 deny_offline_master(Config) ->
     set_roster(Config, both, []),
@@ -457,7 +494,7 @@ block_master(Config) ->
     check_presence_blocked(Config, 'not-acceptable'),
     check_iq_blocked(Config, 'not-acceptable'),
     check_message_blocked(Config, 'not-acceptable'),
-    check_other_blocked(Config, 'not-acceptable'),
+    check_other_blocked(Config, 'not-acceptable', other),
     %% We should always be able to communicate with our home server
     server_send_iqs(Config),
     server_recv_iqs(Config),
@@ -604,24 +641,25 @@ set_default(Config, Name) ->
 
 get_block(Config) ->
     case send_recv(Config, #iq{type = get, sub_els = [#block_list{}]}) of
-	#iq{type = result, sub_els = [#block_list{items = JIDs}]} ->
-	    lists:sort(JIDs);
+	#iq{type = result, sub_els = [#block_list{items = Items}]} ->
+	    lists:sort([JID || #block_item{jid = JID} <- Items]);
 	#iq{type = error} = Err ->
 	    xmpp:get_error(Err)
     end.
 
 set_block(Config, JIDs) ->
+    Items = [#block_item{jid = JID} || JID <- JIDs],
     case send_recv(Config, #iq{type = set,
-			       sub_els = [#block{items = JIDs}]}) of
+			       sub_els = [#block{items = Items}]}) of
 	#iq{type = result, sub_els = []} ->
-	    {#iq{id = I1, sub_els = [#block{items = Items}]},
+	    {#iq{id = I1, sub_els = [#block{items = Items1}]},
 	     #iq{id = I2, sub_els = [#privacy_query{lists = Lists}]}} =
 		?recv2(#iq{type = set, sub_els = [#block{}]},
 		       #iq{type = set, sub_els = [#privacy_query{}]}),
 	    send(Config, #iq{type = result, id = I1}),
 	    send(Config, #iq{type = result, id = I2}),
 	    ct:comment("Checking if all JIDs present in the push"),
-	    true = lists:sort(JIDs) == lists:sort(Items),
+	    true = lists:sort(Items) == lists:sort(Items1),
 	    ct:comment("Getting name of the corresponding privacy list"),
 	    [#privacy_list{name = Name}] = Lists,
 	    {ok, Name};
@@ -631,17 +669,18 @@ set_block(Config, JIDs) ->
 
 set_unblock(Config, JIDs) ->
     ct:comment("Unblocking ~p", [JIDs]),
+    Items = [#block_item{jid = JID} || JID <- JIDs],
     case send_recv(Config, #iq{type = set,
-			       sub_els = [#unblock{items = JIDs}]}) of
+			       sub_els = [#unblock{items = Items}]}) of
 	#iq{type = result, sub_els = []} ->
-	    {#iq{id = I1, sub_els = [#unblock{items = Items}]},
+	    {#iq{id = I1, sub_els = [#unblock{items = Items1}]},
 	     #iq{id = I2, sub_els = [#privacy_query{lists = Lists}]}} =
 		?recv2(#iq{type = set, sub_els = [#unblock{}]},
 		       #iq{type = set, sub_els = [#privacy_query{}]}),
 	    send(Config, #iq{type = result, id = I1}),
 	    send(Config, #iq{type = result, id = I2}),
 	    ct:comment("Checking if all JIDs present in the push"),
-	    true = lists:sort(JIDs) == lists:sort(Items),
+	    true = lists:sort(Items) == lists:sort(Items1),
 	    ct:comment("Getting name of the corresponding privacy list"),
 	    [#privacy_list{name = Name}] = Lists,
 	    {ok, Name};
@@ -700,16 +739,67 @@ check_presence_blocked(Config, Reason) ->
 	      #stanza_error{reason = Reason} = xmpp:get_error(Err)
       end, [available, unavailable]).
 
-check_other_blocked(Config, Reason) ->
+recv_roster_pushes(_Config, 0) ->
+    ok;
+recv_roster_pushes(Config, Count) ->
+    receive
+	#iq{type = set, sub_els = [#roster_query{}]} ->
+	    recv_roster_pushes(Config, Count - 1)
+    end.
+
+recv_err_and_roster_pushes(Config, Count) ->
+    recv_roster_pushes(Config, Count),
+    recv_presence(Config).
+
+check_other_blocked(Config, Reason, Subscription) ->
+    check_other_blocked(Config, Reason, Subscription, undefined).
+
+check_other_blocked(Config, Reason, Subscription, TType) ->
     PeerJID = ?config(peer, Config),
     ct:comment("Checking if subscriptions and presence-errors are blocked"),
     send(Config, #presence{type = error, to = PeerJID}),
+    ct:pal("checking subscription ~p for ~p", [Subscription, TType]),
+    {ErrorFor, PushFor} = case Subscription of
+			      <<"both">> ->
+				  {[subscribe],
+				   [unsubscribe, unsubscribed]};
+			      <<"from">> ->
+				  {[subscribe],
+				   [subscribe, unsubscribe, unsubscribed]};
+			      <<"to">> ->
+				  {[subscribe],
+				   [subscribed, unsubscribed]};
+			      <<"none">> ->
+				  {[subscribe, unsubscribe, unsubscribed],
+				   [subscribe, unsubscribe, unsubscribed]};
+			      _ ->
+				  %% [FIXME] needed to make
+				  %% https://github.com/processone/ejabberd/pull/4512 work, but
+				  %% unclear why
+				  case {TType, ?config(server, Config)} of
+				      {group, <<"mnesia", _/binary>>} ->
+					  {[subscribe],
+					   [unsubscribe, unsubscribed]};
+				      {group, <<"redis", _/binary>>} ->
+					  {[subscribe],
+					   [unsubscribe, unsubscribed]};
+				      _ ->
+					  {[subscribe, unsubscribe, unsubscribed],
+					   [unsubscribe, unsubscribed]}
+				  end
+			  end,
     lists:foreach(
-      fun(Type) ->
-	      #presence{type = error} = Err =
-		  send_recv(Config, #presence{type = Type, to = PeerJID}),
-	      #stanza_error{reason = Reason} = xmpp:get_error(Err)
-      end, [subscribe, subscribed, unsubscribe, unsubscribed]).
+	fun(Type) ->
+	    send(Config, #presence{type = Type, to = PeerJID}),
+	    Count = case lists:member(Type, PushFor) of true -> 1; _ -> 0 end,
+	    case lists:member(Type, ErrorFor) of
+		true ->
+		    Err = recv_err_and_roster_pushes(Config, Count),
+		    #stanza_error{reason = Reason} = xmpp:get_error(Err);
+		_ ->
+		    recv_roster_pushes(Config, Count)
+	    end
+	end, [subscribe, subscribed, unsubscribe, unsubscribed]).
 
 send_presences(Config) ->
     PeerJID = ?config(peer, Config),
@@ -770,7 +860,7 @@ is_message_in_blocked(Opts) ->
 is_message_out_blocked(Opts) ->
     match_all(Opts).
 
-is_iq_in_blocked(Opts) ->    
+is_iq_in_blocked(Opts) ->
     proplists:get_bool(iq, Opts) or match_all(Opts).
 
 is_iq_out_blocked(Opts) ->

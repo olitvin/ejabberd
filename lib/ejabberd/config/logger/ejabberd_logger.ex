@@ -17,11 +17,11 @@ defmodule Ejabberd.Config.EjabberdLogger do
   end
 
   defp do_log_errors({:ok, _mod}), do: nil
-  defp do_log_errors({:error, _mod, errors}), do: Enum.each errors, &do_log_errors/1
-  defp do_log_errors({:attribute, errors}), do: Enum.each errors, &log_attribute_error/1
-  defp do_log_errors({:dependency, errors}), do: Enum.each errors, &log_dependency_error/1
+  defp do_log_errors({:error, _mod, errors}), do: (Enum.each errors, &do_log_errors/1)
+  defp do_log_errors({:attribute, errors}), do: (Enum.each errors, &log_attribute_error/1)
+  defp do_log_errors({:dependency, errors}), do: (Enum.each errors, &log_dependency_error/1)
 
-  defp log_attribute_error({{attr_name, val}, :attr_not_supported}), do:
+  defp log_attribute_error({{attr_name, _val}, :attr_not_supported}), do:
     IO.puts "[ WARN ] Annotation @#{attr_name} is not supported."
 
   defp log_attribute_error({{attr_name, val}, :type_not_supported}), do:
